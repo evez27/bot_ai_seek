@@ -1,0 +1,24 @@
+# Ignorer TOUT par défaut
+*
+
+# Autoriser les fichiers essentiels à bot_funding
+!bot_funding.py
+!data_pipeline.py
+!indicators_ab.py
+!discord_notifier.py
+!news_calendar.py
+!requirements.txt
+!Procfile
+!.gitignore
+!README.md
+
+# Ne jamais envoyer le .env
+.env
+
+# Ignorer les dossiers volumineux et temporaires
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/candles/
+data/*.json

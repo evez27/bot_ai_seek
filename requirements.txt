@@ -1,0 +1,11 @@
+#requirements.txt
+
+pybit>=5.7.0
+numpy>=1.26.0
+python-dotenv>=1.0.0
+pandas>=2.1.0
+
+tabulate
+requests
+beautifulsoup4
+aiohttp
