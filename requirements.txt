@@ -9,3 +9,4 @@ tabulate
 requests
 beautifulsoup4
 aiohttp
+flask

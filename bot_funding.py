@@ -1,14 +1,14 @@
 # ==============================================================================
 # 📛 FICHIER : bot_funding.py
-# ✅ VERSION : V13.2 - Mode Live Bybit + Discord + News Filter
+# ✅ VERSION : V13.3 - Web Service Render + Flask Health + Discord + News Filter
 #    - DRY_RUN=True  -> simulation interne
 #    - DRY_RUN=False -> exécution réelle sur Bybit (testnet ou mainnet)
+#    - 🆕 Serveur HTTP Flask pour éviter la mise en veille Render
 #    - SL natif Bybit, TP géré par le bot, trailing manuel
 #    - Sélection hiérarchique : OB > Swing > VP > S/S > VWAP
-#    - Fourchette : min_sl < dist < sl_max * (1 + tolerance 0.15)
 #    - Pending conservé sur le meilleur niveau hors fourchette
 #    - Notifications Discord (ouvertures, fermetures, heartbeats)
-#    - 🆕 Blocage des trades ±15 min autour des annonces économiques High Impact
+#    - Blocage des trades ±15 min autour des annonces économiques High Impact
 # ==============================================================================
 
 import asyncio
@@ -19,12 +19,20 @@ import time
 import signal
 import hmac
 import hashlib
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Any, Tuple
 from collections import deque
 import numpy as np
 import pandas as pd
 from tabulate import tabulate
+
+# 🆕 Flask pour le serveur de santé (évite la veille Render)
+try:
+    from flask import Flask
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
 
 try:
     from dotenv import load_dotenv
@@ -44,7 +52,7 @@ except ImportError:
     DISCORD_ENABLED = False
     print("⚠️ discord_notifier non trouvé, notifications Discord désactivées")
 
-# 🆕 News calendar
+# News calendar
 try:
     from news_calendar import news_calendar
     NEWS_ENABLED = True
@@ -71,9 +79,8 @@ BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
 BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "true").lower() == "true"
 BYBIT_RECV_WINDOW = 5000
 
-# 🆕 News filter
 NEWS_BUFFER_MINUTES = 15
-NEWS_UPDATE_INTERVAL = 1800  # 30 minutes
+NEWS_UPDATE_INTERVAL = 1800
 
 GLOBAL_RISK_PARAMS = {
     "risk_per_trade": 0.005,
@@ -176,6 +183,27 @@ logger = logging.getLogger("funding_bot")
 logger.setLevel(logging.DEBUG)
 logger.addHandler(handler)
 logger.propagate = False
+
+# ============================
+# 🏥 SERVEUR HTTP DE SANTÉ (Flask)
+# ============================
+if FLASK_AVAILABLE:
+    health_app = Flask(__name__)
+
+    @health_app.route('/health')
+    def health_check():
+        return "OK", 200
+
+    @health_app.route('/')
+    def root():
+        return "Bot Funding running", 200
+
+    def run_health_server():
+        port = int(os.environ.get("PORT", 10000))
+        try:
+            health_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+        except Exception as e:
+            logger.error(f"❌ Erreur serveur HTTP: {e}", extra={'tier': 'GLOBAL'})
 
 # ============================
 # 🔐 BYBIT EXECUTOR
@@ -571,7 +599,7 @@ class MarketAnalyzer:
 # (SUITE DANS LE BLOC 2)
 # ==============================================================================
 # 📛 FICHIER : bot_funding.py (BLOC 2/2)
-# ✅ VERSION : V13.2 - Suite : TradeManager + FundingSuiviBot + Point d'entrée
+# ✅ VERSION : V13.3 - Suite : TradeManager + FundingSuiviBot + Point d'entrée
 # ==============================================================================
 
 # ============================
@@ -796,7 +824,6 @@ class TradeManager:
 
         logger.info(f"✅ Fermé {symbol} {trade.direction} | PnL {pnl_net:+.2f}$ ({pnl_pct_net:+.2f}% notionnel, {pnl_pct_capital:+.2f}% capital) | Raison: {raison}")
 
-        # Discord : notification de fermeture
         if DISCORD_ENABLED and notifier:
             emoji = "🟢" if pnl_net > 0 else "🔴"
             await notifier.send(
@@ -851,7 +878,7 @@ class FundingSuiviBot:
         self.start_time = time.time()
         self.oi_update_interval = 10
         self.oi_last_update = 0
-        self.news_blocked_until = 0  # 🆕 timestamp jusqu'auquel le trading est bloqué
+        self.news_blocked_until = 0
         signal.signal(signal.SIGINT, self._stop)
 
     def _stop(self, *args):
@@ -882,7 +909,6 @@ class FundingSuiviBot:
         else: regime = "Baissier"
         return f"{regime} (ADX {adx:.1f})"
 
-    # 🆕 NEWS : boucle de mise à jour du calendrier
     async def update_news_calendar_loop(self):
         if not NEWS_ENABLED or news_calendar is None:
             logger.info("📅 Filtre news désactivé", extra={'tier': 'NEWS'})
@@ -1039,17 +1065,14 @@ class FundingSuiviBot:
                     to_remove.append(sym)
         for sym in to_remove: self.pending_entries.pop(sym, None)
 
-    # 🆕 Vérification du blocage news
     def is_news_blocked(self):
         if not NEWS_ENABLED or news_calendar is None:
             return False, None
         return news_calendar.is_trade_blocked(buffer_minutes=NEWS_BUFFER_MINUTES)
 
     async def scan_and_trade(self):
-        # 🆕 Vérification news AVANT toute autre chose
         blocked, event = self.is_news_blocked()
         if blocked:
-            # N'envoyer l'alerte Discord qu'une seule fois par fenêtre
             now = time.time()
             if now > self.news_blocked_until:
                 self.news_blocked_until = now + (NEWS_BUFFER_MINUTES * 60)
@@ -1060,7 +1083,7 @@ class FundingSuiviBot:
                 logger.info(msg.replace("\n", " | "), extra={'tier': 'NEWS'})
                 if DISCORD_ENABLED and notifier:
                     await notifier.send(msg)
-            return  # On ne trade pas pendant cette fenêtre
+            return
 
         await self.process_pending_entries()
         btc_regime = await self.get_btc_regime()
@@ -1234,7 +1257,15 @@ class FundingSuiviBot:
 
     async def run(self):
         mode = "LIVE (Testnet)" if BYBIT_TESTNET else ("LIVE (Mainnet)" if not DRY_RUN else "DRY_RUN")
-        logger.info(f"🚀 Bot Funding Suivi V13.2 démarré - Mode: {mode}")
+        logger.info(f"🚀 Bot Funding Suivi V13.3 démarré - Mode: {mode}")
+
+        # 🆕 Démarrage du serveur HTTP de santé (thread séparé)
+        if FLASK_AVAILABLE:
+            port = int(os.environ.get("PORT", 10000))
+            threading.Thread(target=run_health_server, daemon=True).start()
+            logger.info(f"🏥 Serveur HTTP de santé démarré sur le port {port}", extra={'tier': 'GLOBAL'})
+        else:
+            logger.warning("⚠️ Flask non disponible, serveur HTTP désactivé", extra={'tier': 'GLOBAL'})
 
         if DISCORD_ENABLED and notifier:
             await notifier.send(f"🚀 **Bot démarré** - Mode: `{mode}`")
@@ -1254,7 +1285,7 @@ class FundingSuiviBot:
                 logger.warning("⚠️ Impossible de lire le solde Bybit. DRY_RUN forcé.", extra={'tier': 'BYBIT'})
 
         collector_task = asyncio.create_task(self.pipeline.start_background_collector())
-        news_task = asyncio.create_task(self.update_news_calendar_loop())  # 🆕
+        news_task = asyncio.create_task(self.update_news_calendar_loop())
         await asyncio.sleep(15)
         tasks = [
             asyncio.create_task(self._scan_loop()),
@@ -1301,8 +1332,8 @@ class FundingSuiviBot:
             await asyncio.sleep(1)
 
 if __name__ == "__main__":
-    print("🤖 Bot Funding Suivi V13.2")
-    print(f"   DRY_RUN={DRY_RUN} | TESTNET={BYBIT_TESTNET} | DISCORD={DISCORD_ENABLED} | NEWS={NEWS_ENABLED}")
+    print("🤖 Bot Funding Suivi V13.3")
+    print(f"   DRY_RUN={DRY_RUN} | TESTNET={BYBIT_TESTNET} | DISCORD={DISCORD_ENABLED} | NEWS={NEWS_ENABLED} | FLASK={FLASK_AVAILABLE}")
     bot = FundingSuiviBot()
     try:
         asyncio.run(bot.run())

@@ -1,1 +1,1 @@
-worker: python bot_funding.py
+web: python bot_funding.py
