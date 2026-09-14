@@ -1,14 +1,12 @@
 # ==============================================================================
 # 📛 FICHIER : bot_funding.py
-# ✅ VERSION : V13.3 - Web Service Render + Flask Health + Discord + News Filter
-#    - DRY_RUN=True  -> simulation interne
-#    - DRY_RUN=False -> exécution réelle sur Bybit (testnet ou mainnet)
-#    - 🆕 Serveur HTTP Flask pour éviter la mise en veille Render
-#    - SL natif Bybit, TP géré par le bot, trailing manuel
-#    - Sélection hiérarchique : OB > Swing > VP > S/S > VWAP
-#    - Pending conservé sur le meilleur niveau hors fourchette
-#    - Notifications Discord (ouvertures, fermetures, heartbeats)
-#    - Blocage des trades ±15 min autour des annonces économiques High Impact
+# ✅ VERSION : V14.0 - Refonte complète avec correctifs
+#    - 🆕 Fix compteur de trades (compteur global)
+#    - 🆕 Blocage Forex dimanche soir (19h - 01h UTC)
+#    - 🆕 Acceptation des trades "intérieurs à la zone" avec SL minimum
+#    - 🆕 Logs de diagnostic pour investiguer le bug notionnel
+#    - Web Service Flask pour Render
+#    - Discord alerts + News filter
 # ==============================================================================
 
 import asyncio
@@ -27,7 +25,6 @@ import numpy as np
 import pandas as pd
 from tabulate import tabulate
 
-# 🆕 Flask pour le serveur de santé (évite la veille Render)
 try:
     from flask import Flask
     FLASK_AVAILABLE = True
@@ -43,29 +40,26 @@ except ImportError:
 from data_pipeline import DataPipeline, load_json_safe, save_json_atomic, state
 import indicators_ab as ind
 
-# Discord notifier
 try:
     from discord_notifier import notifier
     DISCORD_ENABLED = True
 except ImportError:
     notifier = None
     DISCORD_ENABLED = False
-    print("⚠️ discord_notifier non trouvé, notifications Discord désactivées")
+    print("⚠️ discord_notifier non trouvé")
 
-# News calendar
 try:
     from news_calendar import news_calendar
     NEWS_ENABLED = True
 except ImportError:
     news_calendar = None
     NEWS_ENABLED = False
-    print("⚠️ news_calendar non trouvé, filtre news désactivé")
+    print("⚠️ news_calendar non trouvé")
 
 # ============================
 # 📂 CONFIGURATION
 # ============================
 CAPITAL_INITIAL = 100
-
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 SCAN_INTERVAL = 5
@@ -81,6 +75,11 @@ BYBIT_RECV_WINDOW = 5000
 
 NEWS_BUFFER_MINUTES = 15
 NEWS_UPDATE_INTERVAL = 1800
+
+# 🆕 Blocage Forex dimanche soir
+BLOCAGE_FOREX_ACTIF = True
+BLOCAGE_FOREX_HEURE_DEBUT = 19   # UTC dimanche
+BLOCAGE_FOREX_HEURE_FIN = 1      # UTC lundi matin
 
 GLOBAL_RISK_PARAMS = {
     "risk_per_trade": 0.005,
@@ -580,26 +579,48 @@ class MarketAnalyzer:
             swing_level = breakout_high; ss_level = resistance
         return [("OB", ob_level), ("Swing", swing_level), ("VP", vp_level), ("S/S", ss_level), ("VWAP", vwap)]
 
+    # 🆕 Sélection hiérarchique avec acceptation "intérieur à la zone"
     def select_structural_level(self, entry_price, direction, risk_cfg, priority_levels):
-        min_sl = risk_cfg["min_sl_pct"]; max_sl = risk_cfg["sl_max_pct"]
+        min_sl = risk_cfg["min_sl_pct"]
+        max_sl = risk_cfg["sl_max_pct"]
         tolerance = risk_cfg.get("structure_tolerance", 0.15)
         max_accept = max_sl * (1 + tolerance)
-        best_priority_level = None; best_priority_name = None; best_priority_dist = None
+        
+        best_priority_level = None
+        best_priority_name = None
+        best_priority_dist = None
+        inside_zone_fallback = None  # 🆕 niveau dont la distance est trop petite
+        
         for name, level in priority_levels:
             if level is None: continue
             if direction == "LONG" and level >= entry_price: continue
             if direction == "SHORT" and level <= entry_price: continue
+            
             dist_pct = abs(entry_price - level) / entry_price * 100
+            
             if best_priority_level is None:
-                best_priority_level = level; best_priority_name = name; best_priority_dist = dist_pct
+                best_priority_level = level
+                best_priority_name = name
+                best_priority_dist = dist_pct
+            
+            # Cas 1 : dans la fourchette
             if min_sl <= dist_pct <= max_accept:
                 return level, dist_pct, name, (best_priority_level, best_priority_name, best_priority_dist)
+            
+            # 🆕 Cas 2 : prix à l'intérieur de la zone (dist trop petite)
+            if dist_pct < min_sl and inside_zone_fallback is None:
+                inside_zone_fallback = (level, dist_pct, name)
+        
+        # 🆕 Si aucun niveau n'est dans la fourchette mais qu'on est dans une zone
+        if inside_zone_fallback is not None:
+            level, dist_pct, name = inside_zone_fallback
+            return level, dist_pct, f"{name}(int)", (best_priority_level, best_priority_name, best_priority_dist)
+        
         return None, None, None, (best_priority_level, best_priority_name, best_priority_dist)
 
-# (SUITE DANS LE BLOC 2)
 # ==============================================================================
 # 📛 FICHIER : bot_funding.py (BLOC 2/2)
-# ✅ VERSION : V13.3 - Suite : TradeManager + FundingSuiviBot + Point d'entrée
+# ✅ VERSION : V14.0 - Suite : TradeManager + FundingSuiviBot + Point d'entrée
 # ==============================================================================
 
 # ============================
@@ -652,6 +673,11 @@ class TradeManager:
         self.peak_capital = initial_capital
         self.drawdown_max = 0
         self.stats = {"total_trades": 0, "wins": 0, "losses": 0}
+        # 🆕 Compteurs globaux (indépendants de la liste tronquée à 50)
+        self.total_closed_count = 0
+        self.total_wins = 0
+        self.total_losses = 0
+        self.total_pnl_capital = 0.0
         self.daily_pnl = 0
         self.daily_start_capital = initial_capital
         self.last_day = datetime.now().date()
@@ -676,16 +702,35 @@ class TradeManager:
         risk_cfg = get_category_config(category)["risk"]
         risk_amount = self.capital * risk_cfg["risk_per_trade"]
         sl_distance = entry_price * sl_distance_pct / 100
-        if sl_distance <= 0: return self.get_min_notional()
+        if sl_distance <= 0:
+            return self.get_min_notional()
         size = risk_amount / sl_distance
         notionnel = size * entry_price
-        return max(self.get_min_notional(), min(notionnel, self.get_max_notional()))
+        notionnel = max(self.get_min_notional(), min(notionnel, self.get_max_notional()))
+        return notionnel
 
     async def ouvrir_position(self, symbol, direction, entry_price, sl, tp, ts, atr, funding, score, ms, sl_pct_effectif, category="crypto"):
         if not self.risk_ok(): return False, "Risk engine désactivé"
         if len(self.positions) >= self.get_max_positions(): return False, "Max positions atteint"
         if symbol in self.positions: return False, "Déjà en position"
-        notionnel = self.calculer_notionnel(entry_price, sl_pct_effectif, category)
+        
+        # 🆕 Diagnostic : calcul du notionnel pas à pas
+        risk_cfg = get_category_config(category)["risk"]
+        risk_amount = self.capital * risk_cfg["risk_per_trade"]
+        sl_distance = entry_price * sl_pct_effectif / 100
+        size_theorique = risk_amount / sl_distance if sl_distance > 0 else 0
+        notionnel_theorique = size_theorique * entry_price
+        notionnel_plafonne = max(self.get_min_notional(), min(notionnel_theorique, self.get_max_notional()))
+        
+        logger.info(
+            f"🔎 DIAG {symbol} | Cap={self.capital:.2f}$ | RiskAmt={risk_amount:.4f}$ | "
+            f"SL%={sl_pct_effectif:.2f} | SLdist={sl_distance:.8f} | "
+            f"SizeThéo={size_theorique:.2f} | NotionThéo={notionnel_theorique:.2f}$ | "
+            f"NotionPlaf={notionnel_plafonne:.2f}$ | MaxNotion={self.get_max_notional():.2f}$",
+            extra={'tier': 'DIAG'}
+        )
+        
+        notionnel = notionnel_plafonne
         if notionnel < self.get_min_notional() or notionnel > self.get_max_notional():
             return False, "Notionnel hors limites"
         if self._exposition_actuelle() + notionnel > self.get_exposition_max():
@@ -801,8 +846,16 @@ class TradeManager:
         dd = (self.peak_capital - self.capital) / self.peak_capital * 100 if self.peak_capital else 0
         self.drawdown_max = max(self.drawdown_max, dd)
 
-        if pnl_pct_net > 0: self.stats["wins"] += 1
-        else: self.stats["losses"] += 1
+        if pnl_pct_net > 0:
+            self.stats["wins"] += 1
+            self.total_wins += 1
+        else:
+            self.stats["losses"] += 1
+            self.total_losses += 1
+        
+        # 🆕 Mise à jour des compteurs globaux
+        self.total_closed_count += 1
+        self.total_pnl_capital += pnl_pct_capital
 
         raison = trade.exit_reason if trade.exit_reason else "SL"
 
@@ -820,7 +873,8 @@ class TradeManager:
             "market_structure": trade.market_structure.get("div", "N/A"),
             "trail_mult": trade.trailing_multiplier, "categorie": trade.category
         })
-        if len(self.closed_trades) > 50: self.closed_trades.pop(0)
+        if len(self.closed_trades) > 50:
+            self.closed_trades.pop(0)
 
         logger.info(f"✅ Fermé {symbol} {trade.direction} | PnL {pnl_net:+.2f}$ ({pnl_pct_net:+.2f}% notionnel, {pnl_pct_capital:+.2f}% capital) | Raison: {raison}")
 
@@ -841,27 +895,41 @@ class TradeManager:
     def update_daily_pnl(self):
         today = datetime.now().date()
         if today != self.last_day:
-            self.daily_start_capital = self.capital; self.daily_pnl = 0; self.last_day = today
+            self.daily_start_capital = self.capital
+            self.daily_pnl = 0
+            self.last_day = today
         else:
             self.daily_pnl = self.capital - self.daily_start_capital
 
     def get_metrics(self):
-        total = len(self.closed_trades)
-        wins = [t for t in self.closed_trades if t["pnl"] > 0]
-        losses = [t for t in self.closed_trades if t["pnl"] <= 0]
-        winrate = len(wins) / total * 100 if total else 0
-        pf = sum(t["pnl"] for t in wins) / abs(sum(t["pnl"] for t in losses)) if losses and sum(t["pnl"] for t in losses) != 0 else 99.99
+        # 🆕 Utilise les compteurs globaux
+        total = self.total_closed_count
+        wins = self.total_wins
+        losses = self.total_losses
+        winrate = wins / total * 100 if total > 0 else 0
+        
+        # PF sur les 50 derniers trades (pour refléter la performance récente)
+        recent_wins = [t for t in self.closed_trades if t["pnl"] > 0]
+        recent_losses = [t for t in self.closed_trades if t["pnl"] <= 0]
+        pf = sum(t["pnl"] for t in recent_wins) / abs(sum(t["pnl"] for t in recent_losses)) if recent_losses and sum(t["pnl"] for t in recent_losses) != 0 else 99.99
+        
         exposition = self._exposition_actuelle() / self.capital * 100 if self.capital else 0
-        return {"capital": round(self.capital, 2), "capital_libre": round(self.capital_libre, 2),
-                "pnl_global": round(self.capital - self.initial_capital, 2),
-                "total_trades": total, "wins": len(wins), "losses": len(losses),
-                "winrate": round(winrate, 1), "profit_factor": round(pf, 2),
-                "drawdown_max": round(self.drawdown_max, 1),
-                "exposition_pct": round(exposition, 2),
-                "positions_ouvertes": len(self.positions),
-                "max_positions": self.get_max_positions(),
-                "notionnel_max": self.get_max_notional(),
-                "daily_pnl": round(self.daily_pnl, 2)}
+        return {
+            "capital": round(self.capital, 2),
+            "capital_libre": round(self.capital_libre, 2),
+            "pnl_global": round(self.capital - self.initial_capital, 2),
+            "total_trades": total,           # 🆕 Vrai total
+            "wins": wins,                    # 🆕 Vrai total
+            "losses": losses,                # 🆕 Vrai total
+            "winrate": round(winrate, 1),
+            "profit_factor": round(pf, 2),
+            "drawdown_max": round(self.drawdown_max, 1),
+            "exposition_pct": round(exposition, 2),
+            "positions_ouvertes": len(self.positions),
+            "max_positions": self.get_max_positions(),
+            "notionnel_max": self.get_max_notional(),
+            "daily_pnl": round(self.daily_pnl, 2)
+        }
 
 # ============================
 # 🤖 BOT PRINCIPAL
@@ -879,6 +947,7 @@ class FundingSuiviBot:
         self.oi_update_interval = 10
         self.oi_last_update = 0
         self.news_blocked_until = 0
+        self.forex_blocked_until = 0  # 🆕
         signal.signal(signal.SIGINT, self._stop)
 
     def _stop(self, *args):
@@ -916,6 +985,27 @@ class FundingSuiviBot:
         while not self.stop:
             await news_calendar.fetch_events()
             await asyncio.sleep(NEWS_UPDATE_INTERVAL)
+
+    def is_news_blocked(self):
+        if not NEWS_ENABLED or news_calendar is None:
+            return False, None
+        return news_calendar.is_trade_blocked(buffer_minutes=NEWS_BUFFER_MINUTES)
+
+    # 🆕 Blocage Forex dimanche soir
+    def is_forex_open_blackout(self):
+        if not BLOCAGE_FOREX_ACTIF:
+            return False, None
+        
+        now_utc = datetime.now(timezone.utc)
+        weekday = now_utc.weekday()  # 0=lundi ... 6=dimanche
+        hour = now_utc.hour
+        
+        if weekday == 6 and hour >= BLOCAGE_FOREX_HEURE_DEBUT:
+            return True, f"Dimanche {hour}h UTC (ouverture Forex)"
+        if weekday == 0 and hour < BLOCAGE_FOREX_HEURE_FIN:
+            return True, f"Lundi {hour}h UTC (ouverture Forex)"
+        
+        return False, None
 
     async def calculate_dynamic_sl_tp(self, symbol, direction, entry_price, category="crypto"):
         cfg = get_category_config(category)
@@ -956,11 +1046,23 @@ class FundingSuiviBot:
                     "struct_type": None
                 }
         else:
-            if direction == "LONG": sl = level * 0.997
-            else: sl = level * 1.003
-            sl_pct = abs(entry_price - sl) / entry_price * 100
-            struct_distance_pct = dist_pct
-            pending_level = None
+            # 🆕 Gestion du cas "intérieur à la zone"
+            if type_niveau and "(int)" in type_niveau:
+                # Prix dans la zone → SL forcé au minimum
+                sl_pct = risk_cfg["min_sl_pct"]
+                if direction == "LONG":
+                    sl = entry_price * (1 - sl_pct / 100)
+                else:
+                    sl = entry_price * (1 + sl_pct / 100)
+                struct_distance_pct = sl_pct
+                pending_level = None
+            else:
+                # Cas normal
+                if direction == "LONG": sl = level * 0.997
+                else: sl = level * 1.003
+                sl_pct = abs(entry_price - sl) / entry_price * 100
+                struct_distance_pct = dist_pct
+                pending_level = None
 
         tp_pct = sl_pct * risk_cfg["rr_ratio"]
         tp = entry_price * (1 + tp_pct/100) if direction == "LONG" else entry_price * (1 - tp_pct/100)
@@ -1065,12 +1167,22 @@ class FundingSuiviBot:
                     to_remove.append(sym)
         for sym in to_remove: self.pending_entries.pop(sym, None)
 
-    def is_news_blocked(self):
-        if not NEWS_ENABLED or news_calendar is None:
-            return False, None
-        return news_calendar.is_trade_blocked(buffer_minutes=NEWS_BUFFER_MINUTES)
-
     async def scan_and_trade(self):
+        # 🆕 Vérification Forex
+        forex_blocked, forex_reason = self.is_forex_open_blackout()
+        if forex_blocked:
+            now = time.time()
+            if now > self.forex_blocked_until:
+                self.forex_blocked_until = now + 600
+                msg = (f"🌍 **TRADE BLOQUÉ - Ouverture Forex**\n"
+                       f"Raison: `{forex_reason}`\n"
+                       f"Fenêtre: dimanche 19h - lundi 01h UTC")
+                logger.info(msg.replace("\n", " | "), extra={'tier': 'FOREX'})
+                if DISCORD_ENABLED and notifier:
+                    await notifier.send(msg)
+            return
+        
+        # Vérification news
         blocked, event = self.is_news_blocked()
         if blocked:
             now = time.time()
@@ -1219,12 +1331,17 @@ class FundingSuiviBot:
             mode = "LIVE" if self.executor else "DRY"
             news_status = ""
             if NEWS_ENABLED and news_calendar:
-                blocked, _ = self.is_news_blocked()
-                news_status = " | 🚫 NEWS" if blocked else ""
-            logger.info(f"💓 [{mode}] BTC: {btc_regime} | Capital: {m['capital']}$ | PnL: {m['pnl_global']:+.2f}$ | Trades: {m['total_trades']} (G:{m['wins']}/P:{m['losses']}) | WR: {m['winrate']}% | PF: {m['profit_factor']} | Pos: {m['positions_ouvertes']}{news_status}")
+                blk, _ = self.is_news_blocked()
+                news_status = " | 🚫 NEWS" if blk else ""
+            forex_status = ""
+            fx_blk, _ = self.is_forex_open_blackout()
+            if fx_blk:
+                forex_status = " | 🌍 FOREX"
+            
+            logger.info(f"💓 [{mode}] BTC: {btc_regime} | Capital: {m['capital']}$ | PnL: {m['pnl_global']:+.2f}$ | Trades: {m['total_trades']} (G:{m['wins']}/P:{m['losses']}) | WR: {m['winrate']}% | PF: {m['profit_factor']} | Pos: {m['positions_ouvertes']}{news_status}{forex_status}")
             if DISCORD_ENABLED and notifier:
                 await notifier.send(
-                    f"💓 **[{mode}]** BTC: `{btc_regime}`{news_status}\n"
+                    f"💓 **[{mode}]** BTC: `{btc_regime}`{news_status}{forex_status}\n"
                     f"Capital: `{m['capital']}$` | PnL: `{m['pnl_global']:+.2f}$`\n"
                     f"Trades: `{m['total_trades']}` (G:{m['wins']}/P:{m['losses']}) | WR: `{m['winrate']}%` | PF: `{m['profit_factor']}` | Pos: `{m['positions_ouvertes']}`"
                 )
@@ -1257,9 +1374,8 @@ class FundingSuiviBot:
 
     async def run(self):
         mode = "LIVE (Testnet)" if BYBIT_TESTNET else ("LIVE (Mainnet)" if not DRY_RUN else "DRY_RUN")
-        logger.info(f"🚀 Bot Funding Suivi V13.3 démarré - Mode: {mode}")
+        logger.info(f"🚀 Bot Funding Suivi V14.0 démarré - Mode: {mode}")
 
-        # 🆕 Démarrage du serveur HTTP de santé (thread séparé)
         if FLASK_AVAILABLE:
             port = int(os.environ.get("PORT", 10000))
             threading.Thread(target=run_health_server, daemon=True).start()
@@ -1332,7 +1448,7 @@ class FundingSuiviBot:
             await asyncio.sleep(1)
 
 if __name__ == "__main__":
-    print("🤖 Bot Funding Suivi V13.3")
+    print("🤖 Bot Funding Suivi V14.0")
     print(f"   DRY_RUN={DRY_RUN} | TESTNET={BYBIT_TESTNET} | DISCORD={DISCORD_ENABLED} | NEWS={NEWS_ENABLED} | FLASK={FLASK_AVAILABLE}")
     bot = FundingSuiviBot()
     try:
