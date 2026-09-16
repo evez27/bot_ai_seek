@@ -1,6 +1,8 @@
 # ==============================================================================
 # 📛 FICHIER : data_pipeline.py
-# ✅ VERSION : V5.0 - FOCUS CRYPTO MAJEURS + VOLUME > 50M
+# ✅ VERSION : V6.0 - FOCUS CRYPTO MAJEURS + VOLUME > 50M
+#    - 🆕 Sémaphore global anti-429 (GLOBAL_API_SEMAPHORE)
+#    - 🆕 Cap TOTAL des appels HTTP (pipeline + bot réunis)
 # ==============================================================================
 
 import asyncio
@@ -97,6 +99,23 @@ class PipelineState:
     t2_pret = asyncio.Event()
     stop_flag = False
 state = PipelineState()
+
+# ==============================================================================
+# 🆕 V6.0 — SÉMAPHORE GLOBAL D'API (protection anti-429)
+# ==============================================================================
+# Ce sémaphore est PARTAGÉ entre :
+#   - Les boucles internes du pipeline (TIER1/2/3)
+#   - Les appels du bot (via get_data, update_recent_klines, get_open_interest)
+#
+# Il CAPE le nombre total d'appels concurrents vers Bybit, indépendamment
+# du nombre de callers. C'est la dernière ligne de défense anti-429.
+#
+# Valeur recommandée : 20 (soit ~80 req/s en pointe avec latence 250ms)
+# Ajustable via env var BYBIT_MAX_CONCURRENT pour tuning sans redéploiement.
+# ==============================================================================
+GLOBAL_API_SEMAPHORE = asyncio.Semaphore(
+    int(os.getenv("BYBIT_MAX_CONCURRENT", "20"))
+)
 
 def detecter_categorie(symbole: str) -> str:
     s = symbole.upper()
@@ -199,21 +218,23 @@ class BybitCollector:
         if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
 
+    # 🆕 V6.0 — Régulateur global anti-429 (GLOBAL_API_SEMAPHORE)
     async def safe_get(self, url: str, params: Dict, retries=3) -> Optional[Dict]:
         await self._init_session()
-        for attempt in range(retries):
-            if state.stop_flag: return None
-            try:
-                async with self.session.get(url, params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("retCode") == 0: return data
-                    elif resp.status == 429:
-                        await asyncio.sleep(2 + attempt)
-                        continue
-            except Exception as e:
-                await asyncio.sleep(1.5 * (attempt + 1))
-        return None
+        async with GLOBAL_API_SEMAPHORE:
+            for attempt in range(retries):
+                if state.stop_flag: return None
+                try:
+                    async with self.session.get(url, params=params) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get("retCode") == 0: return data
+                        elif resp.status == 429:
+                            await asyncio.sleep(2 + attempt)
+                            continue
+                except Exception as e:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+            return None
 
     async def get_tickers(self) -> Dict[str, float]:
         url = f"{API_BASE}/v5/market/tickers"
