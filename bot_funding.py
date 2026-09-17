@@ -14,14 +14,13 @@
 #    - 🆕 Reconstruction positions au restart (mapping catégorie)
 #    - 🆕 Label court niveau structurel (OB/SW/VP/SS/VWAP/FB)
 #
-#    Ajustements sizing (validés) :
-#    - Max notionnel = 10% du capital LIBRE (au lieu du capital total)
-#    - Exposition max = 100% (au lieu de 80%)
+#    Fixes V14.1-Perf (17/09) :
+#    - 🐛 Fix crash select_structural_level (format None dist)
+#    - 🐛 Fix précision SL/TP sur petits prix (round_to_tick au lieu de round(x,4))
 #
-#    Conservé V14.0 :
-#    - Trailing activation 1.2% + step 0.3%
-#    - SL après TP = breakeven
-#    - Compteur global trades, Forex blackout, "intérieur zone", etc.
+#    Ajustements sizing (validés) :
+#    - Max notionnel = 10% du capital LIBRE
+#    - Exposition max = 100%
 # ==============================================================================
 
 import asyncio
@@ -53,7 +52,6 @@ try:
 except ImportError:
     pass
 
-# 🆕 Import detecter_categorie pour reconstruction positions
 from data_pipeline import DataPipeline, load_json_safe, save_json_atomic, state, detecter_categorie
 import indicators_ab as ind
 
@@ -93,10 +91,10 @@ BYBIT_RECV_WINDOW = 5000
 NEWS_BUFFER_MINUTES = 15
 NEWS_UPDATE_INTERVAL = 1800
 
-# 🆕 Blocage Forex dimanche soir
+# Blocage Forex dimanche soir
 BLOCAGE_FOREX_ACTIF = True
-BLOCAGE_FOREX_HEURE_DEBUT = 19   # UTC dimanche
-BLOCAGE_FOREX_HEURE_FIN = 1      # UTC lundi matin
+BLOCAGE_FOREX_HEURE_DEBUT = 19
+BLOCAGE_FOREX_HEURE_FIN = 1
 
 GLOBAL_RISK_PARAMS = {
     "risk_per_trade": 0.005,
@@ -117,12 +115,10 @@ GLOBAL_RISK_PARAMS = {
     "sl_update_min_interval": 5,
 }
 
-# ============================
-# 🆕 CONSTANTES V14.1-Perf (uniquement sizing)
-# ============================
-MIN_NOTIONAL_USD = 5.0         # min 5$
-MAX_NOTIONAL_PCT_LIBRE = 0.10  # 🆕 10% du capital LIBRE (au lieu du total)
-EXPO_MAX_PCT = 1.00            # 🆕 100% (au lieu de 80%)
+# Constantes V14.1-Perf
+MIN_NOTIONAL_USD = 5.0
+MAX_NOTIONAL_PCT_LIBRE = 0.10
+EXPO_MAX_PCT = 1.00
 
 CATEGORY_CONFIG = {
     "crypto": {
@@ -238,9 +234,9 @@ class BybitExecutor:
         self.base_url = "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
         self.recv_window = BYBIT_RECV_WINDOW
         self.session = None
-        self.sl_last_update = {}    # rate-limit SL
-        self.sl_pending = {}        # 🆕 {symbol: sl} en attente de flush
-        self.sl_last_sent = {}      # 🆕 {symbol: sl} dernière valeur envoyée
+        self.sl_last_update = {}
+        self.sl_pending = {}
+        self.sl_last_sent = {}
 
     async def _init_session(self):
         import aiohttp
@@ -268,7 +264,7 @@ class BybitExecutor:
         param_str = str(timestamp) + self.api_key + str(self.recv_window) + json.dumps(params, separators=(',', ':'))
         return hmac.new(self.api_secret.encode(), param_str.encode(), hashlib.sha256).hexdigest()
 
-    # 🆕 Signature GET avec tri alphabétique (Bybit exige les params triés pour GET)
+    # 🆕 Signature GET avec tri alphabétique
     async def _get(self, endpoint: str, params: dict = None) -> Optional[Dict]:
         await self._init_session()
         params = params or {}
@@ -341,7 +337,6 @@ class BybitExecutor:
         except Exception:
             return []
 
-    # 🆕 Récupère une position précise (pour vérif SL post-ordre & restart)
     async def get_position(self, symbol: str) -> Optional[Dict]:
         data = await self._get("/v5/position/list", {"category": "linear", "symbol": symbol})
         if not data: return None
@@ -368,10 +363,8 @@ class BybitExecutor:
             params["tpslMode"] = "Full"
         return await self._post("/v5/order/create", params)
 
-    # 🆕 set_trading_stop avec pending + flush (fix désync)
     async def set_trading_stop(self, symbol: str, stop_loss: float) -> Optional[Dict]:
         sl_rounded = self.round_to_tick(stop_loss)
-        # Toujours mémoriser l'intention (même si rate-limited)
         self.sl_pending[symbol] = sl_rounded
         now = time.time()
         last = self.sl_last_update.get(symbol, 0)
@@ -388,12 +381,10 @@ class BybitExecutor:
         if result:
             self.sl_last_update[symbol] = time.time()
             self.sl_last_sent[symbol] = sl_rounded
-            # On ne supprime le pending que si on a bien envoyé la valeur courante
             if self.sl_pending.get(symbol) == sl_rounded:
                 self.sl_pending.pop(symbol, None)
         return result
 
-    # 🆕 Flush périodique du pending (appelé par monitor_positions)
     async def flush_pending_sl(self):
         if not self.sl_pending:
             return
@@ -404,7 +395,6 @@ class BybitExecutor:
                 logger.info(f"🔄 Flush SL pending {symbol} -> {sl_rounded}", extra={'tier': 'BYBIT'})
                 await self._send_sl(symbol, sl_rounded)
 
-    # 🆕 Vérification post-ordre : le SL est-il bien actif côté Bybit ?
     async def verify_sl_active(self, symbol: str, expected_sl: float, tolerance_pct: float = 0.1) -> bool:
         pos = await self.get_position(symbol)
         if pos is None:
@@ -434,13 +424,6 @@ class BybitExecutor:
 
 # ==============================================================================
 # 🛑 FIN DU BLOC 1/3
-# Le BLOC 2/3 contient :
-#   - MarketAnalyzer (avec select_structural_level explicite + symbol param)
-#   - Trade + TradeManager (V14.0 logique + reconstruction + max_notional libre + expo 100%)
-#
-# Le BLOC 3/3 contient :
-#   - FundingSuiviBot (SÉQUENTIEL — pas de sémaphores)
-#   - Point d'entrée main
 # ==============================================================================
 # ============================
 # 🧠 MARKET ANALYZER
@@ -706,7 +689,8 @@ class MarketAnalyzer:
     #     → suffixe "(int)" → SL forcé à sl_min_pct
     #   PRIORITÉ 3 : Sinon → rejet avec pending sur 1er niveau valide
     #
-    # 🆕 Ajout : paramètre `symbol` pour logging debug (aucun impact fonctionnel)
+    # 🐛 FIX 17/09 : Protection contre best_priority_dist = None
+    #    (crashait avec TypeError sur le format .2f)
     # ============================================================
     def select_structural_level(self, entry_price, direction, risk_cfg, priority_levels, symbol: str = "?"):
         min_sl = risk_cfg["min_sl_pct"]
@@ -754,11 +738,18 @@ class MarketAnalyzer:
             )
             return level, dist_pct, f"{name}(int)", (best_priority_level, best_priority_name, best_priority_dist)
 
-        logger.debug(
-            f"🎯 {symbol} aucun niveau acceptable "
-            f"(pending sur {best_priority_name} dist={best_priority_dist:.2f}% si dispo)",
-            extra={'tier': 'SL'}
-        )
+        # 🐛 FIX 17/09 : protection None
+        if best_priority_dist is not None:
+            logger.debug(
+                f"🎯 {symbol} aucun niveau acceptable "
+                f"(pending sur {best_priority_name} dist={best_priority_dist:.2f}% si dispo)",
+                extra={'tier': 'SL'}
+            )
+        else:
+            logger.debug(
+                f"🎯 {symbol} aucun niveau acceptable (aucun niveau valide trouvé)",
+                extra={'tier': 'SL'}
+            )
         return None, None, None, (best_priority_level, best_priority_name, best_priority_dist)
 
 
@@ -813,7 +804,6 @@ class TradeManager:
         self.peak_capital = initial_capital
         self.drawdown_max = 0
         self.stats = {"total_trades": 0, "wins": 0, "losses": 0}
-        # Compteurs globaux (indépendants de la liste tronquée à 50)
         self.total_closed_count = 0
         self.total_wins = 0
         self.total_losses = 0
@@ -827,14 +817,14 @@ class TradeManager:
         return 20 if self.capital < 1000 else min(int(self.capital // 50), 50)
 
     def get_min_notional(self):
-        return MIN_NOTIONAL_USD  # 5$
+        return MIN_NOTIONAL_USD
 
     def get_max_notional(self):
-        # 🆕 V14.1-Perf : 10% du capital LIBRE
+        # V14.1-Perf : 10% du capital LIBRE
         return round(self.capital_libre * MAX_NOTIONAL_PCT_LIBRE, 2) if self.capital < 1000 else 200.0
 
     def get_exposition_max(self):
-        # 🆕 V14.1-Perf : 100%
+        # V14.1-Perf : 100%
         return self.capital * EXPO_MAX_PCT
 
     def _exposition_actuelle(self):
@@ -903,14 +893,13 @@ class TradeManager:
             # ✅ Vérif SL post-ordre TOLÉRANTE (12s / 3 tentatives / PAS de close)
             sl_ok = False
             for attempt in range(3):
-                await asyncio.sleep(2.0)  # 2s, 4s, 6s
+                await asyncio.sleep(2.0)
                 sl_ok = await self.executor.verify_sl_active(symbol, sl_rounded, tolerance_pct=0.3)
                 if sl_ok:
                     break
                 logger.debug(f"⏳ SL {symbol} non visible (tentative {attempt+1}/3)", extra={'tier': 'BYBIT'})
 
             if not sl_ok:
-                # On NE ferme PAS — position maintenue, le SL sera synchronisé par flush_pending_sl()
                 logger.warning(
                     f"⚠️ SL {symbol} non confirmé après 12s — position maintenue, "
                     f"surveillance via flush_pending_sl()",
@@ -930,11 +919,7 @@ class TradeManager:
         return True, "Position ouverte"
 
     # ============================================================
-    # 🎯 GESTION DES SORTIES — 100% V14.0 (aucune modif)
-    #   - Trailing activation : +1.2% de gain → SL = entry (breakeven + sécurité)
-    #   - Trailing step : 0.3% sous le pic
-    #   - SL après TP : breakeven
-    #   - Monotone : le SL ne fait que monter (LONG) / descendre (SHORT)
+    # 🎯 GESTION DES SORTIES — 100% V14.0
     # ============================================================
     async def gerer_sorties(self, symbol, high, low, close, atr):
         trade = self.positions.get(symbol)
@@ -1110,9 +1095,8 @@ class TradeManager:
             "daily_pnl": round(self.daily_pnl, 2)
         }
 
-    # 🆕 Reconstruction des positions au restart (avec mapping catégorie)
+    # 🆕 Reconstruction des positions au restart
     async def reconstruct_positions_from_bybit(self):
-        """Reconstruit self.positions depuis Bybit + récupère la vraie catégorie."""
         if self.executor is None:
             return
 
@@ -1222,13 +1206,12 @@ class FundingSuiviBot:
             return False, None
         return news_calendar.is_trade_blocked(buffer_minutes=NEWS_BUFFER_MINUTES)
 
-    # 🆕 Blocage Forex dimanche soir
     def is_forex_open_blackout(self):
         if not BLOCAGE_FOREX_ACTIF:
             return False, None
 
         now_utc = datetime.now(timezone.utc)
-        weekday = now_utc.weekday()  # 0=lundi ... 6=dimanche
+        weekday = now_utc.weekday()
         hour = now_utc.hour
 
         if weekday == 6 and hour >= BLOCAGE_FOREX_HEURE_DEBUT:
@@ -1303,10 +1286,14 @@ class FundingSuiviBot:
             trail_pct = sl_pct * 0.75
         ts = entry_price * (1 - trail_pct/100) if direction == "LONG" else entry_price * (1 + trail_pct/100)
 
+        # 🐛 FIX PRÉCISION 17/09 : round_to_tick au lieu de round(x, 4)
+        #    → adapte la précision au prix (0.000828 pour IOST, 67320.4 pour BTC)
         return {
-            "sl": round(sl, 4), "tp": round(tp, 4), "ts": round(ts, 4),
+            "sl": BybitExecutor.round_to_tick(sl),
+            "tp": BybitExecutor.round_to_tick(tp),
+            "ts": BybitExecutor.round_to_tick(ts),
             "sl_pct": round(sl_pct, 2), "tp_pct": round(tp_pct, 2),
-            "atr": round(atr, 4) if atr else 0,
+            "atr": round(atr, 8) if atr else 0,
             "support": support, "resistance": resistance,
             "struct_distance_pct": round(struct_distance_pct, 2),
             "pending_level": None, "pending_name": None, "pending_dist": None,
@@ -1320,7 +1307,11 @@ class FundingSuiviBot:
         sl = entry_price * (1 - sl_pct/100) if direction == "LONG" else entry_price * (1 + sl_pct/100)
         tp = entry_price * (1 + tp_pct/100) if direction == "LONG" else entry_price * (1 - tp_pct/100)
         ts = sl
-        return {"sl": sl, "tp": tp, "ts": ts, "sl_pct": sl_pct, "tp_pct": tp_pct, "atr": 0,
+        # 🐛 FIX PRÉCISION 17/09 : round_to_tick
+        return {"sl": BybitExecutor.round_to_tick(sl),
+                "tp": BybitExecutor.round_to_tick(tp),
+                "ts": BybitExecutor.round_to_tick(ts),
+                "sl_pct": sl_pct, "tp_pct": tp_pct, "atr": 0,
                 "support": 0, "resistance": 0, "struct_distance_pct": None,
                 "pending_level": None, "pending_name": None, "pending_dist": None,
                 "reject_reason": None, "struct_type": None}
@@ -1348,10 +1339,6 @@ class FundingSuiviBot:
 
     # 🆕 Label court pour affichage Discord / logs
     def _short_struct_label(self, struct_type: Optional[str]) -> str:
-        """
-        Convertit le nom complet d'un niveau structurel en label court.
-        Ex: 'OB' → 'OB', 'OB(int)' → 'OB-int', 'Swing' → 'SW', 'Fallback' → 'FB'
-        """
         if not struct_type:
             return "?"
         s = struct_type.replace("(int)", "-int").replace("()", "")
@@ -1406,7 +1393,7 @@ class FundingSuiviBot:
 
         return text[:max_len]
 
-    # 🆕 V14.1-Perf — SÉQUENTIEL (identique V14.0)
+    # 🆕 V14.1-Perf — SÉQUENTIEL (identique V14.0 + label court)
     async def process_pending_entries(self):
         if not self.pending_entries: return
         now = time.time(); to_remove = []
@@ -1455,7 +1442,7 @@ class FundingSuiviBot:
                     to_remove.append(sym)
         for sym in to_remove: self.pending_entries.pop(sym, None)
 
-    # 🆕 V14.1-Perf — SÉQUENTIEL (identique V14.0 + label court dans logs/Discord)
+    # 🆕 V14.1-Perf — SÉQUENTIEL (identique V14.0 + label court)
     async def scan_and_trade(self):
         # Vérification Forex
         forex_blocked, forex_reason = self.is_forex_open_blackout()
@@ -1578,16 +1565,16 @@ class FundingSuiviBot:
                 short_label = self._short_struct_label(sltp.get('struct_type'))
                 logger.info(
                     f"✅ Ouverture {c['direction']}({short_label}) {c['symbol']} @ {entry_price:.4f} | "
-                    f"SL {sltp['sl']:.4f} ({sltp['sl_pct']:.2f}%) | "
-                    f"TP {sltp['tp']:.4f} | Score {c['score']}"
+                    f"SL {sltp['sl']:.6f} ({sltp['sl_pct']:.2f}%) | "
+                    f"TP {sltp['tp']:.6f} | Score {c['score']}"
                 )
                 self.last_trade_time[c["symbol"]] = time.time()
                 if DISCORD_ENABLED and notifier:
                     await notifier.send(
                         f"✅ **OUVERTURE {c['direction']}({short_label})** `{c['symbol']}`\n"
-                        f"Prix: `{entry_price:.4f}`\n"
-                        f"SL: `{sltp['sl']:.4f}` ({sltp['sl_pct']:.2f}%) → niveau `{short_label}`\n"
-                        f"TP: `{sltp['tp']:.4f}`\n"
+                        f"Prix: `{entry_price:.6f}`\n"
+                        f"SL: `{sltp['sl']:.6f}` ({sltp['sl_pct']:.2f}%) → niveau `{short_label}`\n"
+                        f"TP: `{sltp['tp']:.6f}`\n"
                         f"Score: `{c['score']:.0f}` | Dist struct: `{sltp.get('struct_distance_pct','?')}%`"
                     )
             else:
@@ -1596,7 +1583,6 @@ class FundingSuiviBot:
 
     # 🆕 V14.1-Perf — SÉQUENTIEL + flush_pending_sl en début de cycle
     async def monitor_positions(self):
-        # 🆕 Flush du pending SL AVANT de monitorer
         if self.executor is not None:
             await self.executor.flush_pending_sl()
 
