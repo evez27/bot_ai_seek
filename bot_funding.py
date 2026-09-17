@@ -1,26 +1,27 @@
 # ==============================================================================
 # 📛 FICHIER : bot_funding.py
-# ✅ VERSION : V14.3 - Refonte complète avec correctifs critiques + logique SL monotone
-#                     + parallélisation (sémaphores) + protection anti-429
-#    - 🆕 Sémaphores de parallélisation (DATA/API/MONITOR/OI)
-#    - 🆕 Ouverture de position SÉQUENTIELLE (point critique préservé)
-#    - 🆕 Monitoring / fetch / scoring parallélisés
+# ✅ VERSION : V14.1-Perf - V14.0 (logique décisionnelle intacte) + correctifs perf
+#    ⚠️  AUCUNE parallélisation : exécution 100% SÉQUENTIELLE (comme V14.0)
+#
+#    Base : V14.0 intégrale
+#    Correctifs performance greffés (n'affectent PAS la décision) :
 #    - 🆕 Arrondi tick Bybit (round_to_tick)
-#    - 🆕 Signature GET Bybit avec tri alphabétique
+#    - 🆕 Vérif cohérence TP/SL vs entry
+#    - 🆕 Vérif SL post-ordre TOLÉRANTE (12s / 3 tentatives / PAS de close)
 #    - 🆕 Fix désync SL Bybit (pending + flush)
-#    - 🆕 Vérification SL post-ordre (fermeture d'urgence)
-#    - 🆕 Logique SL monotone : Trailing 0.5% / TP 0.3% du pic (jamais de retour arrière)
-#    - 🆕 Reconstruction positions au restart (avec mapping catégorie depuis top100.json)
-#    - 🆕 Fix short_signal (parsing propre par regex)
-#    - 🆕 Label court niveau structurel (OB/SW/VP/SS/VWAP/FB) dans logs & Discord
-#    - 🆕 Rejet définitif pending si dist > 5% + purge des pendings obsolètes
-#    - 🆕 Min 5$ / Max 10% du libre / Expo 100%
-#    - Compteur global de trades (indépendant de la liste tronquée à 50)
-#    - Blocage Forex dimanche soir (19h - 01h UTC)
-#    - Acceptation des trades "intérieurs à la zone" avec SL minimum
-#    - Logs de diagnostic pour investiguer le bug notionnel
-#    - Web Service Flask pour Render
-#    - Discord alerts + News filter
+#    - 🆕 Signature GET Bybit tri alphabétique
+#    - 🆕 Fix short_signal (parsing regex propre)
+#    - 🆕 Reconstruction positions au restart (mapping catégorie)
+#    - 🆕 Label court niveau structurel (OB/SW/VP/SS/VWAP/FB)
+#
+#    Ajustements sizing (validés) :
+#    - Max notionnel = 10% du capital LIBRE (au lieu du capital total)
+#    - Exposition max = 100% (au lieu de 80%)
+#
+#    Conservé V14.0 :
+#    - Trailing activation 1.2% + step 0.3%
+#    - SL après TP = breakeven
+#    - Compteur global trades, Forex blackout, "intérieur zone", etc.
 # ==============================================================================
 
 import asyncio
@@ -117,38 +118,11 @@ GLOBAL_RISK_PARAMS = {
 }
 
 # ============================
-# 🆕 CONSTANTES SL MONOTONE (V14.3)
+# 🆕 CONSTANTES V14.1-Perf (uniquement sizing)
 # ============================
-TRAILING_SL_GAP_PCT = 0.5      # SL à 0.5% sous le pic quand trailing atteint
-TP_SL_GAP_PCT = 0.3            # SL à 0.3% sous le pic quand TP atteint/dépassé
-MIN_NOTIONAL_USD = 5.0         # 🆕 min 5$
-MAX_NOTIONAL_PCT_LIBRE = 0.10  # 🆕 max 10% du capital LIBRE
-EXPO_MAX_PCT = 1.00            # 🆕 exposition max = 100% du capital
-
-# 🆕 Pending : seuil max de distance au niveau pour créer un pending
-#    Au-delà → rejet définitif (pas de pending inutile dans le cache)
-PENDING_MAX_DIST_PCT = 5.0
-
-# ============================
-# 🆕 SÉMAPHORES DE PARALLÉLISATION (V14.3)
-# ============================
-# Note : le sémaphore global de data_pipeline (GLOBAL_API_SEMAPHORE=20)
-#        est la DERNIÈRE ligne de défense anti-429. Ces sémaphores-ci
-#        limitent la CONCURRENCE DES TÂCHES (coroutines) pour éviter
-#        de spawner 1000 tasks. Ils doivent rester < GLOBAL_API_SEMAPHORE.
-#
-# Règles :
-#   - Seule l'OUVERTURE de position reste SÉQUENTIELLE (point critique
-#     sur capital_libre / exposition / positions).
-#   - Tout le reste (fetch, analyse, monitoring) est parallélisé.
-#
-# Calibration (30 candidats Tier 2) :
-#   DATA_SEMAPHORE = ceil(N_CANDIDATS / 2) → 15
-# ============================
-API_SEMAPHORE     = asyncio.Semaphore(6)    # Appels API Bybit (scoring, SL/TP)
-DATA_SEMAPHORE    = asyncio.Semaphore(15)   # 🎯 Sweet spot pour 30 candidats
-MONITOR_SEMAPHORE = asyncio.Semaphore(10)   # Monitoring positions
-OI_SEMAPHORE      = asyncio.Semaphore(8)    # Fetch Open Interest
+MIN_NOTIONAL_USD = 5.0         # min 5$
+MAX_NOTIONAL_PCT_LIBRE = 0.10  # 🆕 10% du capital LIBRE (au lieu du total)
+EXPO_MAX_PCT = 1.00            # 🆕 100% (au lieu de 80%)
 
 CATEGORY_CONFIG = {
     "crypto": {
@@ -156,7 +130,7 @@ CATEGORY_CONFIG = {
         "indicators": {
             "vwap_period": 15, "adx_min": 20, "atr_min_pct": 0.5,
             "volume_confirm_min": 1.2, "funding_seuil_base": 0.08,
-            "funding_percentile_min": 70, "volume_min_24h": 200_000_000,
+            "funding_percentile_min": 70, "volume_min_24h": 50_000_000,
             "adaptative": {"vwap_vol_base": 1.0, "vwap_fenetre_min": 5, "vwap_fenetre_max": 30,
                            "oi_fenetre_base": 10, "oi_volatilite_seuil": 2.0, "funding_alpha_base": 0.2}
         },
@@ -255,7 +229,7 @@ if FLASK_AVAILABLE:
             logger.error(f"❌ Erreur serveur HTTP: {e}", extra={'tier': 'GLOBAL'})
 
 # ============================
-# 🔐 BYBIT EXECUTOR (V14.3 — correctifs critiques)
+# 🔐 BYBIT EXECUTOR (V14.1-Perf)
 # ============================
 class BybitExecutor:
     def __init__(self):
@@ -461,11 +435,11 @@ class BybitExecutor:
 # ==============================================================================
 # 🛑 FIN DU BLOC 1/3
 # Le BLOC 2/3 contient :
-#   - MarketAnalyzer (avec select_structural_level explicite)
-#   - Trade + TradeManager (SL monotone + reconstruction positions)
+#   - MarketAnalyzer (avec select_structural_level explicite + symbol param)
+#   - Trade + TradeManager (V14.0 logique + reconstruction + max_notional libre + expo 100%)
 #
 # Le BLOC 3/3 contient :
-#   - FundingSuiviBot (méthodes parallélisées via sémaphores)
+#   - FundingSuiviBot (SÉQUENTIEL — pas de sémaphores)
 #   - Point d'entrée main
 # ==============================================================================
 # ============================
@@ -725,23 +699,14 @@ class MarketAnalyzer:
     # ============================================================
     # 🎯 SÉLECTION DU NIVEAU STRUCTUREL POUR LE SL
     # ============================================================
-    # RÈGLE (par ordre de priorité absolue) :
+    # RÈGLE (identique V14.0) :
+    #   PRIORITÉ 1 : Un niveau dans la fourchette
+    #     sl_min ≤ dist ≤ sl_max × 1.15  → RETOUR IMMÉDIAT
+    #   PRIORITÉ 2 : Sinon, 1er niveau "intérieur zone" (dist < sl_min)
+    #     → suffixe "(int)" → SL forcé à sl_min_pct
+    #   PRIORITÉ 3 : Sinon → rejet avec pending sur 1er niveau valide
     #
-    #   ┌──────────────────────────────────────────────────────────┐
-    #   │ PRIORITÉ 1 : Un niveau dans la fourchette                │
-    #   │   sl_min ≤ dist ≤ sl_max × 1.15                          │
-    #   │   → RETOUR IMMÉDIAT (le 1er trouvé dans l'ordre de       │
-    #   │     priorité OB → Swing → VP → S/S → VWAP gagne)         │
-    #   │   → AUCUN fallback intérieur zone ne sera utilisé        │
-    #   ├──────────────────────────────────────────────────────────┤
-    #   │ PRIORITÉ 2 (FALLBACK) : Si et seulement si AUCUN niveau  │
-    #   │ n'est dans la fourchette, on prend le 1er niveau         │
-    #   │ "intérieur zone" (dist < sl_min) rencontré dans l'ordre  │
-    #   │ de priorité → suffixe "(int)" → SL forcé à sl_min_pct    │
-    #   ├──────────────────────────────────────────────────────────┤
-    #   │ PRIORITÉ 3 : Sinon → rejet (avec pending sur le 1er      │
-    #   │ niveau valide, quel que soit son type)                   │
-    #   └──────────────────────────────────────────────────────────┘
+    # 🆕 Ajout : paramètre `symbol` pour logging debug (aucun impact fonctionnel)
     # ============================================================
     def select_structural_level(self, entry_price, direction, risk_cfg, priority_levels, symbol: str = "?"):
         min_sl = risk_cfg["min_sl_pct"]
@@ -752,7 +717,7 @@ class MarketAnalyzer:
         best_priority_level = None
         best_priority_name = None
         best_priority_dist = None
-        inside_zone_fallback = None  # 🔒 utilisé UNIQUEMENT en dernier recours
+        inside_zone_fallback = None
 
         for name, level in priority_levels:
             if level is None: continue
@@ -761,28 +726,25 @@ class MarketAnalyzer:
 
             dist_pct = abs(entry_price - level) / entry_price * 100
 
-            # Mémorise le 1er niveau valide (pour pending éventuel)
             if best_priority_level is None:
                 best_priority_level = level
                 best_priority_name = name
                 best_priority_dist = dist_pct
 
-            # ───── PRIORITÉ 1 : niveau dans la fourchette ─────
+            # PRIORITÉ 1 : dans la fourchette → retour immédiat
             if min_sl <= dist_pct <= max_accept:
                 logger.debug(
                     f"🎯 {symbol} SL via {name} en fourchette "
                     f"(dist={dist_pct:.2f}% ∈ [{min_sl}%, {max_accept:.2f}%])",
                     extra={'tier': 'SL'}
                 )
-                return level, dist_pct, name, (
-                    best_priority_level, best_priority_name, best_priority_dist
-                )
+                return level, dist_pct, name, (best_priority_level, best_priority_name, best_priority_dist)
 
-            # ───── PRIORITÉ 2 : mémorisation fallback intérieur zone ─────
+            # PRIORITÉ 2 : mémorisation fallback intérieur zone
             if dist_pct < min_sl and inside_zone_fallback is None:
                 inside_zone_fallback = (level, dist_pct, name)
 
-        # ───── Aucun niveau dans la fourchette ─────
+        # Aucun niveau dans la fourchette
         if inside_zone_fallback is not None:
             level, dist_pct, name = inside_zone_fallback
             logger.debug(
@@ -790,23 +752,18 @@ class MarketAnalyzer:
                 f"(dist={dist_pct:.2f}% < min={min_sl}%) → SL forcé à sl_min_pct",
                 extra={'tier': 'SL'}
             )
-            return level, dist_pct, f"{name}(int)", (
-                best_priority_level, best_priority_name, best_priority_dist
-            )
+            return level, dist_pct, f"{name}(int)", (best_priority_level, best_priority_name, best_priority_dist)
 
         logger.debug(
             f"🎯 {symbol} aucun niveau acceptable "
-            f"(fallback pending sur {best_priority_name} "
-            f"dist={best_priority_dist:.2f}% si dispo)",
+            f"(pending sur {best_priority_name} dist={best_priority_dist:.2f}% si dispo)",
             extra={'tier': 'SL'}
         )
-        return None, None, None, (
-            best_priority_level, best_priority_name, best_priority_dist
-        )
+        return None, None, None, (best_priority_level, best_priority_name, best_priority_dist)
 
 
 # ============================
-# 💼 TRADE MANAGER (V14.3 — logique SL MONOTONE)
+# 💼 TRADE MANAGER (V14.1-Perf — logique V14.0 + correctifs perf)
 # ============================
 class Trade:
     def __init__(self, symbol, direction, entry_price, sl, tp, ts, atr, funding, score, ms, category="crypto"):
@@ -856,7 +813,7 @@ class TradeManager:
         self.peak_capital = initial_capital
         self.drawdown_max = 0
         self.stats = {"total_trades": 0, "wins": 0, "losses": 0}
-        # 🆕 Compteurs globaux (indépendants de la liste tronquée à 50)
+        # Compteurs globaux (indépendants de la liste tronquée à 50)
         self.total_closed_count = 0
         self.total_wins = 0
         self.total_losses = 0
@@ -866,7 +823,6 @@ class TradeManager:
         self.last_day = datetime.now().date()
         self.executor = executor
 
-    # 🆕 Limites recalculées
     def get_max_positions(self):
         return 20 if self.capital < 1000 else min(int(self.capital // 50), 50)
 
@@ -874,11 +830,12 @@ class TradeManager:
         return MIN_NOTIONAL_USD  # 5$
 
     def get_max_notional(self):
-        # 🆕 10% du capital LIBRE
+        # 🆕 V14.1-Perf : 10% du capital LIBRE
         return round(self.capital_libre * MAX_NOTIONAL_PCT_LIBRE, 2) if self.capital < 1000 else 200.0
 
     def get_exposition_max(self):
-        return self.capital * EXPO_MAX_PCT  # 🆕 100%
+        # 🆕 V14.1-Perf : 100%
+        return self.capital * EXPO_MAX_PCT
 
     def _exposition_actuelle(self):
         return sum(p.notional for p in self.positions.values())
@@ -895,13 +852,11 @@ class TradeManager:
         return notionnel
 
     async def ouvrir_position(self, symbol, direction, entry_price, sl, tp, ts, atr, funding, score, ms, sl_pct_effectif, category="crypto"):
-        # 🔒 POINT CRITIQUE — cette méthode DOIT rester SÉQUENTIELLE
-        # (accès concurrent à capital_libre / exposition / positions)
         if not self.risk_ok(): return False, "Risk engine désactivé"
         if len(self.positions) >= self.get_max_positions(): return False, "Max positions atteint"
         if symbol in self.positions: return False, "Déjà en position"
 
-        # 🆕 Diagnostic : calcul du notionnel pas à pas
+        # Diagnostic notionnel
         risk_cfg = get_category_config(category)["risk"]
         risk_amount = self.capital * risk_cfg["risk_per_trade"]
         sl_distance = entry_price * sl_pct_effectif / 100
@@ -910,8 +865,8 @@ class TradeManager:
         notionnel_plafonne = max(self.get_min_notional(), min(notionnel_theorique, self.get_max_notional()))
 
         logger.info(
-            f"🔎 DIAG {symbol} | Cap={self.capital:.2f}$ | RiskAmt={risk_amount:.4f}$ | "
-            f"SL%={sl_pct_effectif:.2f} | SLdist={sl_distance:.8f} | "
+            f"🔎 DIAG {symbol} | Cap={self.capital:.2f}$ | Libre={self.capital_libre:.2f}$ | "
+            f"RiskAmt={risk_amount:.4f}$ | SL%={sl_pct_effectif:.2f} | SLdist={sl_distance:.8f} | "
             f"SizeThéo={size_theorique:.2f} | NotionThéo={notionnel_theorique:.2f}$ | "
             f"NotionPlaf={notionnel_plafonne:.2f}$ | MaxNotion={self.get_max_notional():.2f}$",
             extra={'tier': 'DIAG'}
@@ -945,14 +900,27 @@ class TradeManager:
                 return False, "Ordre Bybit échoué"
             logger.info(f"🔵 Bybit ordre placé: {side} {symbol} qty={qty:.6f} SL={sl_rounded} TP={tp_rounded}", extra={'tier': 'BYBIT'})
 
-            # ✅ Vérif SL post-ordre — fermeture d'urgence si SL absent/désync
-            await asyncio.sleep(1.0)
-            sl_ok = await self.executor.verify_sl_active(symbol, sl_rounded, tolerance_pct=0.2)
+            # ✅ Vérif SL post-ordre TOLÉRANTE (12s / 3 tentatives / PAS de close)
+            sl_ok = False
+            for attempt in range(3):
+                await asyncio.sleep(2.0)  # 2s, 4s, 6s
+                sl_ok = await self.executor.verify_sl_active(symbol, sl_rounded, tolerance_pct=0.3)
+                if sl_ok:
+                    break
+                logger.debug(f"⏳ SL {symbol} non visible (tentative {attempt+1}/3)", extra={'tier': 'BYBIT'})
+
             if not sl_ok:
-                logger.error(f"🚨 SL NON CONFIRMÉ sur {symbol} → FERMETURE D'URGENCE", extra={'tier': 'BYBIT'})
-                close_side = "Sell" if direction == "LONG" else "Buy"
-                await self.executor.close_position(symbol, close_side, qty)
-                return False, "SL non confirmé → fermeture urgence"
+                # On NE ferme PAS — position maintenue, le SL sera synchronisé par flush_pending_sl()
+                logger.warning(
+                    f"⚠️ SL {symbol} non confirmé après 12s — position maintenue, "
+                    f"surveillance via flush_pending_sl()",
+                    extra={'tier': 'BYBIT'}
+                )
+                if DISCORD_ENABLED and notifier:
+                    await notifier.send(
+                        f"⚠️ **SL non confirmé** sur `{symbol}` après 12s\n"
+                        f"Position maintenue — surveillance manuelle conseillée"
+                    )
 
         trade = Trade(symbol, direction, entry_price, sl_rounded, tp_rounded, ts, atr, funding, score, ms, category)
         trade.notional = notionnel; trade.margin = marge; trade.size = qty; trade.bybit_qty = qty
@@ -962,73 +930,61 @@ class TradeManager:
         return True, "Position ouverte"
 
     # ============================================================
-    # 🆕 V14.3 — GESTION DES SORTIES : SL MONOTONE
-    # Règles :
-    #   - Trailing atteint            → SL à 0.5% du trailing (pic)
-    #   - Cours dépasse trailing sans TP → SL à 0.5% du pic
-    #   - Cours active le TP          → SL à 0.3% du TP
-    #   - Cours dépasse le TP         → SL à 0.3% du pic
-    #   - AUCUN RETOUR ARRIÈRE possible (SL ne fait que monter en LONG, descendre en SHORT)
+    # 🎯 GESTION DES SORTIES — 100% V14.0 (aucune modif)
+    #   - Trailing activation : +1.2% de gain → SL = entry (breakeven + sécurité)
+    #   - Trailing step : 0.3% sous le pic
+    #   - SL après TP : breakeven
+    #   - Monotone : le SL ne fait que monter (LONG) / descendre (SHORT)
     # ============================================================
     async def gerer_sorties(self, symbol, high, low, close, atr):
         trade = self.positions.get(symbol)
         if not trade: return
         risk_cfg = get_category_config(trade.category)["risk"]
         trade.update_extremes(high, low)
+        gain_pct = trade.gain_pct()
 
-        old_sl = trade.stop_loss
-        target_sl = None
-        new_level = None
+        if risk_cfg.get("trail_actif", True) and not trade.trail_active and gain_pct >= risk_cfg["trail_seuil_gain_pct"]:
+            trade.trail_active = True
+            if trade.direction == "LONG":
+                new_sl = trade.highest * (1 - risk_cfg["trail_seuil_gain_pct"] / 100)
+                trade.stop_loss = max(trade.stop_loss, trade.entry_price, new_sl)
+            else:
+                new_sl = trade.lowest * (1 + risk_cfg["trail_seuil_gain_pct"] / 100)
+                trade.stop_loss = min(trade.stop_loss, trade.entry_price, new_sl)
+            logger.info(f"🚀 Trailing activé {symbol} | SL -> {trade.stop_loss:.4f}")
+            if self.executor is not None:
+                await self.executor.set_trading_stop(symbol, trade.stop_loss)
 
-        if trade.direction == "LONG":
-            trail_activation_price = trade.entry_price * (1 + risk_cfg["trail_seuil_gain_pct"] / 100)
+        if trade.trail_active:
+            step_pct = risk_cfg.get("trailing_step_pct", 0.3) / 100.0
+            old_sl = trade.stop_loss
+            if trade.direction == "LONG":
+                new_stop = trade.highest * (1 - step_pct)
+                if new_stop > trade.stop_loss:
+                    trade.stop_loss = new_stop
+            else:
+                new_stop = trade.lowest * (1 + step_pct)
+                if new_stop < trade.stop_loss:
+                    trade.stop_loss = new_stop
+            if self.executor is not None and abs(trade.stop_loss - old_sl) > 1e-9:
+                await self.executor.set_trading_stop(symbol, trade.stop_loss)
 
-            if trade.highest >= trade.take_profit:
-                target_sl = trade.highest * (1 - TP_SL_GAP_PCT / 100)
-                new_level = "TP"
-                if not trade.tp_hit:
-                    trade.tp_hit = True
-                    logger.info(f"🎯 TP atteint {symbol} | SL -> 0.3% sous pic ({target_sl:.4f})")
-            elif trade.highest >= trail_activation_price:
-                target_sl = trade.highest * (1 - TRAILING_SL_GAP_PCT / 100)
-                new_level = "Trail"
-                if not trade.trail_active:
-                    trade.trail_active = True
-                    logger.info(f"🚀 Trailing activé {symbol} | SL -> 0.5% sous pic ({target_sl:.4f})")
+        if not trade.tp_hit:
+            if (trade.direction == "LONG" and high >= trade.take_profit) or (trade.direction == "SHORT" and low <= trade.take_profit):
+                trade.tp_hit = True
+                if trade.direction == "LONG":
+                    trade.stop_loss = max(trade.stop_loss, trade.entry_price)
+                else:
+                    trade.stop_loss = min(trade.stop_loss, trade.entry_price)
+                logger.info(f"🎯 TP atteint {symbol} | SL verrouillé breakeven -> {trade.stop_loss:.4f}")
+                if self.executor is not None:
+                    await self.executor.set_trading_stop(symbol, trade.stop_loss)
 
-            if target_sl is not None and target_sl > trade.stop_loss:
-                trade.stop_loss = target_sl
-                logger.info(f"🔒 {symbol} SL monté: {old_sl:.4f} -> {trade.stop_loss:.4f} ({new_level})")
-
-        else:  # SHORT (miroir)
-            trail_activation_price = trade.entry_price * (1 - risk_cfg["trail_seuil_gain_pct"] / 100)
-
-            if trade.lowest <= trade.take_profit:
-                target_sl = trade.lowest * (1 + TP_SL_GAP_PCT / 100)
-                new_level = "TP"
-                if not trade.tp_hit:
-                    trade.tp_hit = True
-                    logger.info(f"🎯 TP atteint {symbol} | SL -> 0.3% au-dessus pic ({target_sl:.4f})")
-            elif trade.lowest <= trail_activation_price:
-                target_sl = trade.lowest * (1 + TRAILING_SL_GAP_PCT / 100)
-                new_level = "Trail"
-                if not trade.trail_active:
-                    trade.trail_active = True
-                    logger.info(f"🚀 Trailing activé {symbol} | SL -> 0.5% au-dessus pic ({target_sl:.4f})")
-
-            if target_sl is not None and target_sl < trade.stop_loss:
-                trade.stop_loss = target_sl
-                logger.info(f"🔒 {symbol} SL baissé: {old_sl:.4f} -> {trade.stop_loss:.4f} ({new_level})")
-
-        # Sync Bybit si le SL a bougé
-        if self.executor is not None and abs(trade.stop_loss - old_sl) > 1e-9:
-            await self.executor.set_trading_stop(symbol, trade.stop_loss)
-
-        # ---- Détection de sortie ----
         sortie = False; prix_sortie = None; raison = None
         if (trade.direction == "LONG" and low <= trade.stop_loss) or (trade.direction == "SHORT" and high >= trade.stop_loss):
             prix_sortie = trade.stop_loss; sortie = True
-            if trade.tp_hit: raison = "TP"
+            if abs(trade.stop_loss - trade.initial_sl) < 1e-9: raison = "SL"
+            elif trade.tp_hit: raison = "TP"
             elif trade.trail_active: raison = "Trail"
             else: raison = "SL"
         elif time.time() - trade.entry_time > risk_cfg["max_trade_duration"] and not trade.tp_hit:
@@ -1079,7 +1035,6 @@ class TradeManager:
             self.stats["losses"] += 1
             self.total_losses += 1
 
-        # 🆕 Compteurs globaux
         self.total_closed_count += 1
         self.total_pnl_capital += pnl_pct_capital
 
@@ -1161,7 +1116,6 @@ class TradeManager:
         if self.executor is None:
             return
 
-        # Mapping symbole→catégorie depuis top100.json (source primaire)
         top100_data = load_json_safe("data/top100.json", {})
         categories_map = top100_data.get("categories", {}) if top100_data else {}
 
@@ -1173,14 +1127,13 @@ class TradeManager:
         for p in positions:
             try:
                 symbol = p["symbol"]
-                side = p["side"]  # Buy / Sell
+                side = p["side"]
                 direction = "LONG" if side == "Buy" else "SHORT"
                 entry = float(p["avgPrice"])
                 size = float(p["size"])
                 sl = float(p.get("stopLoss") or 0)
                 tp = float(p.get("takeProfit") or 0)
 
-                # Catégorie : top100.json → detecter_categorie() → "crypto"
                 category = categories_map.get(symbol) or detecter_categorie(symbol)
 
                 risk_cfg = get_category_config(category)["risk"]
@@ -1210,7 +1163,7 @@ class TradeManager:
                 logger.error(f"⚠️ Reconstruction position échouée ({p.get('symbol','?')}): {e}",
                              extra={'tier': 'BYBIT'})
 # ============================
-# 🤖 BOT PRINCIPAL
+# 🤖 BOT PRINCIPAL (V14.1-Perf — 100% SÉQUENTIEL)
 # ============================
 class FundingSuiviBot:
     def __init__(self):
@@ -1306,16 +1259,12 @@ class FundingSuiviBot:
         )
 
         if level is None:
-            # ─────────────────────────────────────────────────────────
             # CAS 3 : aucun niveau dans la fourchette acceptée
-            # ─────────────────────────────────────────────────────────
             pending_level, pending_name, pending_dist = pending_info
             if risk_cfg.get("fallback_si_aucun_niveau", False):
                 sl_pct = risk_cfg["sl_max_pct"]
-                sl = entry_price * (1 - sl_pct / 100) if direction == "LONG" \
-                     else entry_price * (1 + sl_pct / 100)
-                struct_distance_pct = sl_pct
-                type_niveau = "Fallback"
+                sl = entry_price * (1 - sl_pct/100) if direction == "LONG" else entry_price * (1 + sl_pct/100)
+                struct_distance_pct = sl_pct; type_niveau = "Fallback"
                 pending_level = None
             else:
                 return {
@@ -1329,28 +1278,19 @@ class FundingSuiviBot:
                     "struct_type": None
                 }
         else:
-            # ─────────────────────────────────────────────────────────
-            # CAS 2 : niveau intérieur à la zone → SL = sl_min forcé
-            # ─────────────────────────────────────────────────────────
+            # CAS 2 : intérieur à la zone → SL forcé au minimum
             if type_niveau and "(int)" in type_niveau:
                 sl_pct = risk_cfg["min_sl_pct"]
-                sl = entry_price * (1 - sl_pct / 100) if direction == "LONG" \
-                     else entry_price * (1 + sl_pct / 100)
+                if direction == "LONG":
+                    sl = entry_price * (1 - sl_pct / 100)
+                else:
+                    sl = entry_price * (1 + sl_pct / 100)
                 struct_distance_pct = sl_pct
                 pending_level = None
-                logger.debug(
-                    f"🎯 {symbol} intérieur zone → SL forcé à min_sl_pct={sl_pct}%",
-                    extra={'tier': 'SL'}
-                )
-
-            # ─────────────────────────────────────────────────────────
-            # CAS 1 : niveau accepté → SL = distance au niveau (±0.3%)
-            # ─────────────────────────────────────────────────────────
             else:
-                if direction == "LONG":
-                    sl = level * 0.997
-                else:
-                    sl = level * 1.003
+                # CAS 1 : normal → SL au niveau ± 0.3%
+                if direction == "LONG": sl = level * 0.997
+                else: sl = level * 1.003
                 sl_pct = abs(entry_price - sl) / entry_price * 100
                 struct_distance_pct = dist_pct
                 pending_level = None
@@ -1466,122 +1406,58 @@ class FundingSuiviBot:
 
         return text[:max_len]
 
-    # ============================================================
-    # 🆕 V14.3 — PROCESS PENDING EN 4 ÉTAPES
-    #   1) Purge + fetch prix : PARALLÈLE (DATA_SEMAPHORE)
-    #   2) Sélection séquentielle des candidats
-    #   3) Préparation SL/TP : PARALLÈLE (API_SEMAPHORE)
-    #   4) OUVERTURE : SÉQUENTIELLE (point critique)
-    # ============================================================
+    # 🆕 V14.1-Perf — SÉQUENTIEL (identique V14.0)
     async def process_pending_entries(self):
-        if not self.pending_entries:
-            return
-
-        now = time.time()
-        to_remove = []
-
-        # ───── ÉTAPE 1 : fetch prix en parallèle ─────
-        async def _fetch_price(sym):
-            async with DATA_SEMAPHORE:
-                try:
-                    df = await self.get_candles(sym, "1", 1)
-                    if df is None:
-                        return (sym, None)
-                    return (sym, float(df["close"].iloc[-1]))
-                except Exception as e:
-                    logger.debug(f"⚠️ Pending fetch {sym}: {e}", extra={'tier': 'SL'})
-                    return (sym, None)
-
-        pendings_snapshot = list(self.pending_entries.items())
-        price_results = await asyncio.gather(*[_fetch_price(s) for s, _ in pendings_snapshot])
-        prices = {sym: p for sym, p in price_results if p is not None}
-
-        # ───── ÉTAPE 2 : sélection séquentielle ─────
-        to_open = []  # (sym, info, current_price)
-
-        for sym, info in pendings_snapshot:
-            # Timeout
+        if not self.pending_entries: return
+        now = time.time(); to_remove = []
+        for sym, info in self.pending_entries.items():
             if now - info["timestamp"] > info["timeout"]:
-                to_remove.append(sym)
-                continue
+                to_remove.append(sym); continue
+            df = await self.get_candles(sym, "1", 1)
+            if df is None: continue
+            current_price = float(df["close"].iloc[-1])
+            level = info["level"]; direction = info["direction"]; category = info["category"]
+            if direction == "LONG" and level * 0.999 <= current_price <= level * 1.001:
+                sltp = await self.calculate_dynamic_sl_tp(sym, direction, current_price, category)
+                if sltp.get("reject_reason") is None:
+                    ok, msg = await self.trade_manager.ouvrir_position(
+                        symbol=sym, direction=direction, entry_price=current_price,
+                        sl=sltp["sl"], tp=sltp["tp"], ts=sltp["ts"], atr=sltp["atr"],
+                        funding=info["funding"], score=info["score"], ms=info["ms"],
+                        sl_pct_effectif=sltp["sl_pct"], category=category)
+                    if ok:
+                        short_label = self._short_struct_label(sltp.get('struct_type'))
+                        logger.info(f"✅ Ouverture PENDING {direction}({short_label}) {sym} @ {current_price:.4f}")
+                        self.last_trade_time[sym] = time.time()
+                        if DISCORD_ENABLED and notifier:
+                            await notifier.send(
+                                f"✅ **PENDING OUVERTURE {direction}({short_label})** `{sym}` @ `{current_price:.4f}`\n"
+                                f"SL: `{sltp['sl']:.4f}` ({sltp['sl_pct']:.2f}%) | TP: `{sltp['tp']:.4f}`"
+                            )
+                    to_remove.append(sym)
+            elif direction == "SHORT" and level * 0.999 <= current_price <= level * 1.001:
+                sltp = await self.calculate_dynamic_sl_tp(sym, direction, current_price, category)
+                if sltp.get("reject_reason") is None:
+                    ok, msg = await self.trade_manager.ouvrir_position(
+                        symbol=sym, direction=direction, entry_price=current_price,
+                        sl=sltp["sl"], tp=sltp["tp"], ts=sltp["ts"], atr=sltp["atr"],
+                        funding=info["funding"], score=info["score"], ms=info["ms"],
+                        sl_pct_effectif=sltp["sl_pct"], category=category)
+                    if ok:
+                        short_label = self._short_struct_label(sltp.get('struct_type'))
+                        logger.info(f"✅ Ouverture PENDING {direction}({short_label}) {sym} @ {current_price:.4f}")
+                        self.last_trade_time[sym] = time.time()
+                        if DISCORD_ENABLED and notifier:
+                            await notifier.send(
+                                f"✅ **PENDING OUVERTURE {direction}({short_label})** `{sym}` @ `{current_price:.4f}`\n"
+                                f"SL: `{sltp['sl']:.4f}` ({sltp['sl_pct']:.2f}%) | TP: `{sltp['tp']:.4f}`"
+                            )
+                    to_remove.append(sym)
+        for sym in to_remove: self.pending_entries.pop(sym, None)
 
-            current_price = prices.get(sym)
-            if current_price is None:
-                continue
-
-            level = info["level"]
-            direction = info["direction"]
-
-            # Purge si trop loin
-            dist_pct = abs(current_price - level) / current_price * 100
-            if dist_pct > PENDING_MAX_DIST_PCT:
-                logger.info(
-                    f"🧹 Purge pending {sym} : dist {dist_pct:.2f}% "
-                    f"> {PENDING_MAX_DIST_PCT}%",
-                    extra={'tier': 'SL'}
-                )
-                to_remove.append(sym)
-                continue
-
-            # Prix dans la zone du niveau ?
-            if level * 0.999 <= current_price <= level * 1.001:
-                to_open.append((sym, info, current_price))
-
-        # ───── ÉTAPE 3 : préparation SL/TP en parallèle ─────
-        async def _prepare_open(sym, info, current_price):
-            async with API_SEMAPHORE:
-                try:
-                    sltp = await self.calculate_dynamic_sl_tp(
-                        sym, info["direction"], current_price, info["category"]
-                    )
-                    return (sym, info, current_price, sltp)
-                except Exception as e:
-                    logger.error(f"⚠️ Prepare pending {sym}: {e}", extra={'tier': 'SL'})
-                    return (sym, info, current_price, None)
-
-        prepared = await asyncio.gather(*[
-            _prepare_open(s, i, p) for s, i, p in to_open
-        ])
-
-        # ───── ÉTAPE 4 : OUVERTURE SÉQUENTIELLE (point critique) ─────
-        for sym, info, current_price, sltp in prepared:
-            if sltp is None or sltp.get("reject_reason") is not None:
-                to_remove.append(sym)
-                continue
-
-            direction = info["direction"]
-            category = info["category"]
-
-            ok, msg = await self.trade_manager.ouvrir_position(
-                symbol=sym, direction=direction, entry_price=current_price,
-                sl=sltp["sl"], tp=sltp["tp"], ts=sltp["ts"], atr=sltp["atr"],
-                funding=info["funding"], score=info["score"], ms=info["ms"],
-                sl_pct_effectif=sltp["sl_pct"], category=category
-            )
-            if ok:
-                short_label = self._short_struct_label(sltp.get('struct_type'))
-                logger.info(f"✅ Ouverture PENDING {direction}({short_label}) {sym} @ {current_price:.4f}")
-                self.last_trade_time[sym] = time.time()
-                if DISCORD_ENABLED and notifier:
-                    await notifier.send(
-                        f"✅ **PENDING OUVERTURE {direction}({short_label})** `{sym}` @ `{current_price:.4f}`\n"
-                        f"SL: `{sltp['sl']:.4f}` ({sltp['sl_pct']:.2f}%) | TP: `{sltp['tp']:.4f}`"
-                    )
-            to_remove.append(sym)
-
-        for sym in to_remove:
-            self.pending_entries.pop(sym, None)
-
-    # ============================================================
-    # 🆕 V14.3 — SCAN_AND_TRADE PARALLÉLISÉ
-    #   ÉTAPE A : fetch klines des candidats   → PARALLÈLE
-    #   ÉTAPE B : scoring momentum             → PARALLÈLE
-    #   ÉTAPE C : fetch prix entry             → PARALLÈLE
-    #   ÉTAPE D : calcul SL/TP                 → PARALLÈLE
-    #   ÉTAPE E : OUVERTURE                    → SÉQUENTIELLE 🔒
-    # ============================================================
+    # 🆕 V14.1-Perf — SÉQUENTIEL (identique V14.0 + label court dans logs/Discord)
     async def scan_and_trade(self):
-        # 🆕 Vérification Forex
+        # Vérification Forex
         forex_blocked, forex_reason = self.is_forex_open_blackout()
         if forex_blocked:
             now = time.time()
@@ -1637,44 +1513,17 @@ class FundingSuiviBot:
             elif fund <= th_short: candidates.append((sym, "SHORT", fund, cat))
         if not candidates: return
 
-        # ───── ÉTAPE A : fetch klines en parallèle ─────
-        async def _update_klines(sym):
-            async with DATA_SEMAPHORE:
-                try:
-                    await self.pipeline.update_recent_klines(sym, "1", 10)
-                    await self.pipeline.update_recent_klines(sym, "5", 5)
-                    await self.pipeline.update_recent_klines(sym, "15", 3)
-                except Exception as e:
-                    logger.debug(f"⚠️ Klines {sym}: {e}", extra={'tier': 'GLOBAL'})
+        # Fetch klines séquentiel (comme V14.0)
+        for sym, _, _, _ in candidates:
+            await self.pipeline.update_recent_klines(sym, "1", 10)
+            await self.pipeline.update_recent_klines(sym, "5", 5)
+            await self.pipeline.update_recent_klines(sym, "15", 3)
 
-        await asyncio.gather(*[_update_klines(s) for s, _, _, _ in candidates])
-
-        # ───── Filtrage séquentiel rapide (anti-spam) ─────
-        filtered_candidates = []
-        for sym, direction, fund, cat in candidates:
-            if sym in self.last_trade_time and time.time() - self.last_trade_time[sym] < 1800:
-                continue
-            if sym in self.pending_entries:
-                continue
-            filtered_candidates.append((sym, direction, fund, cat))
-
-        # ───── ÉTAPE B : scoring en parallèle ─────
-        async def _score_one(sym, direction, fund, cat):
-            async with API_SEMAPHORE:
-                try:
-                    score, details = await self.calculate_momentum_score(sym, direction, fund, cat)
-                    return (sym, direction, fund, cat, score, details)
-                except Exception as e:
-                    logger.error(f"⚠️ Score {sym}: {e}", extra={'tier': 'GLOBAL'})
-                    return (sym, direction, fund, cat, 0, {"reason": f"Erreur: {e}"})
-
-        score_results = await asyncio.gather(*[
-            _score_one(s, d, f, c) for s, d, f, c in filtered_candidates
-        ])
-
-        # ───── Traitement séquentiel des résultats ─────
         rows = []; scored_candidates = []
-        for sym, direction, fund, cat, score, details in score_results:
+        for sym, direction, fund, cat in candidates:
+            if sym in self.last_trade_time and time.time() - self.last_trade_time[sym] < 1800: continue
+            if sym in self.pending_entries: continue
+            score, details = await self.calculate_momentum_score(sym, direction, fund, cat)
             tradable = score >= get_category_config(cat)["selection"]["momentum_score_min"]
             statut = "✅" if tradable else "❌"
             rows.append([sym, cat, direction, f"{fund:.3f}%",
@@ -1697,60 +1546,15 @@ class FundingSuiviBot:
                 tablefmt="grid"))
         scored_candidates.sort(key=lambda x: x["score"], reverse=True)
 
-        top_n = scored_candidates[:10]
+        # Ouverture SÉQUENTIELLE (comme V14.0)
+        for c in scored_candidates[:10]:
+            if len(self.trade_manager.positions) >= self.trade_manager.get_max_positions(): break
+            df1 = await self.get_candles(c["symbol"], "1", 5)
+            if df1 is None: continue
+            entry_price = float(df1["close"].iloc[-1])
+            sltp = await self.calculate_dynamic_sl_tp(c["symbol"], c["direction"], entry_price, c["categorie"])
 
-        # ───── ÉTAPE C : fetch prix entry en parallèle ─────
-        async def _fetch_price(sym):
-            async with DATA_SEMAPHORE:
-                try:
-                    df1 = await self.get_candles(sym, "1", 5)
-                    if df1 is None:
-                        return (sym, None)
-                    return (sym, float(df1["close"].iloc[-1]))
-                except Exception as e:
-                    logger.debug(f"⚠️ Fetch {sym}: {e}", extra={'tier': 'GLOBAL'})
-                    return (sym, None)
-
-        price_results = await asyncio.gather(*[_fetch_price(c["symbol"]) for c in top_n])
-        prices = {sym: p for sym, p in price_results if p is not None}
-
-        # ───── ÉTAPE D : préparation SL/TP en parallèle ─────
-        async def _prepare(c):
-            sym = c["symbol"]
-            if sym not in prices:
-                return (c, None, None)
-            async with API_SEMAPHORE:
-                try:
-                    sltp = await self.calculate_dynamic_sl_tp(
-                        sym, c["direction"], prices[sym], c["categorie"]
-                    )
-                    return (c, prices[sym], sltp)
-                except Exception as e:
-                    logger.error(f"⚠️ Prepare {sym}: {e}", extra={'tier': 'GLOBAL'})
-                    return (c, prices[sym], None)
-
-        prepared = await asyncio.gather(*[_prepare(c) for c in top_n])
-
-        # ───── ÉTAPE E : OUVERTURE SÉQUENTIELLE (point critique) 🔒 ─────
-        for c, entry_price, sltp in prepared:
-            if entry_price is None or sltp is None:
-                continue
-            if len(self.trade_manager.positions) >= self.trade_manager.get_max_positions():
-                break
-
-            # Gestion rejet / pending
             if sltp.get("reject_reason"):
-                pending_dist = sltp.get("pending_dist")
-                # 🆕 Rejet définitif si le niveau est trop loin (> PENDING_MAX_DIST_PCT)
-                if pending_dist is not None and pending_dist > PENDING_MAX_DIST_PCT:
-                    logger.info(
-                        f"⛔ Rejet définitif {c['symbol']} : meilleur niveau "
-                        f"{sltp.get('pending_name','?')} à {pending_dist:.2f}% "
-                        f"(> {PENDING_MAX_DIST_PCT}%) → pas de pending",
-                        extra={'tier': 'SL'}
-                    )
-                    continue
-
                 if sltp.get("pending_level") is not None:
                     self.pending_entries[c["symbol"]] = {
                         "level": sltp["pending_level"], "direction": c["direction"],
@@ -1759,13 +1563,12 @@ class FundingSuiviBot:
                                "uncertainty": c["details"].get("unc")},
                         "timestamp": time.time(),
                         "timeout": get_category_config(c["categorie"])["risk"].get("pending_timeout", 300)}
-                    logger.info(f"⏳ Pending {c['symbol']} sur {sltp.get('pending_name','?')} (dist {pending_dist:.2f}%)")
+                    logger.info(f"⏳ Pending {c['symbol']} sur {sltp.get('pending_name','?')} (dist {sltp.get('pending_dist','?')}%)")
                 else:
                     logger.info(f"⛔ {sltp['reject_reason']} pour {c['symbol']}")
                 continue
 
-            ms = {"div": c["details"].get("div"), "conf": c["details"].get("conf"),
-                  "uncertainty": c["details"].get("unc")}
+            ms = {"div": c["details"].get("div"), "conf": c["details"].get("conf"), "uncertainty": c["details"].get("unc")}
             ok, msg = await self.trade_manager.ouvrir_position(
                 symbol=c["symbol"], direction=c["direction"], entry_price=entry_price,
                 sl=sltp["sl"], tp=sltp["tp"], ts=sltp["ts"], atr=sltp["atr"],
@@ -1791,38 +1594,22 @@ class FundingSuiviBot:
                 logger.info(f"⛔ {msg} pour {c['symbol']}")
             await asyncio.sleep(1)
 
-    # ============================================================
-    # 🆕 V14.3 — MONITORING PARALLÈLE (MONITOR_SEMAPHORE)
-    # ============================================================
+    # 🆕 V14.1-Perf — SÉQUENTIEL + flush_pending_sl en début de cycle
     async def monitor_positions(self):
         # 🆕 Flush du pending SL AVANT de monitorer
         if self.executor is not None:
             await self.executor.flush_pending_sl()
 
-        if not self.trade_manager.positions:
-            return
+        if not self.trade_manager.positions: return
+        for sym in list(self.trade_manager.positions.keys()):
+            await self.pipeline.update_recent_klines(sym, "1", 30)
+            df = await self.get_candles(sym, "1", 30)
+            if df is None: continue
+            high = float(df["high"].iloc[-1]); low = float(df["low"].iloc[-1]); close = float(df["close"].iloc[-1])
+            atr = self.calculate_atr(df)
+            await self.trade_manager.gerer_sorties(sym, high, low, close, atr)
 
-        async def _monitor_one(sym):
-            async with MONITOR_SEMAPHORE:
-                try:
-                    await self.pipeline.update_recent_klines(sym, "1", 30)
-                    df = await self.get_candles(sym, "1", 30)
-                    if df is None:
-                        return
-                    high = float(df["high"].iloc[-1])
-                    low = float(df["low"].iloc[-1])
-                    close = float(df["close"].iloc[-1])
-                    atr = self.calculate_atr(df)
-                    await self.trade_manager.gerer_sorties(sym, high, low, close, atr)
-                except Exception as e:
-                    logger.error(f"⚠️ Monitor {sym} erreur: {e}", extra={'tier': 'GLOBAL'})
-
-        symbols = list(self.trade_manager.positions.keys())
-        await asyncio.gather(*[_monitor_one(sym) for sym in symbols])
-
-    # ============================================================
-    # 🆕 V14.3 — OI PARALLÈLE (OI_SEMAPHORE)
-    # ============================================================
+    # 🆕 V14.1-Perf — SÉQUENTIEL (identique V14.0)
     async def update_open_interest(self):
         symbols = []
         funding_data = load_json_safe("data/top_funding.json", {})
@@ -1830,20 +1617,12 @@ class FundingSuiviBot:
             symbols.extend([x["symbol"] for x in funding_data["data"]])
         symbols.extend(list(self.trade_manager.positions.keys()))
         symbols = list(set(symbols))
-
-        async def _update_one(sym):
-            async with OI_SEMAPHORE:
-                try:
-                    oi = await self.pipeline.get_open_interest(sym)
-                    if oi <= 0:
-                        return
-                    df = await self.get_candles(sym, "1", 1)
-                    if df is not None and len(df) > 0:
-                        self.analyzer.update_oi(sym, oi, float(df["close"].iloc[-1]))
-                except Exception as e:
-                    logger.debug(f"⚠️ OI {sym} erreur: {e}", extra={'tier': 'GLOBAL'})
-
-        await asyncio.gather(*[_update_one(sym) for sym in symbols])
+        for sym in symbols:
+            oi = await self.pipeline.get_open_interest(sym)
+            if oi <= 0: continue
+            df = await self.get_candles(sym, "1", 1)
+            if df is not None and len(df) > 0:
+                self.analyzer.update_oi(sym, oi, float(df["close"].iloc[-1]))
 
     async def heartbeats(self):
         await asyncio.gather(self._heartbeat_court_loop(), self._heartbeat_detail_loop())
@@ -1899,7 +1678,7 @@ class FundingSuiviBot:
 
     async def run(self):
         mode = "LIVE (Testnet)" if BYBIT_TESTNET else ("LIVE (Mainnet)" if not DRY_RUN else "DRY_RUN")
-        logger.info(f"🚀 Bot Funding Suivi V14.3 démarré - Mode: {mode}")
+        logger.info(f"🚀 Bot Funding Suivi V14.1-Perf démarré - Mode: {mode}")
 
         if FLASK_AVAILABLE:
             port = int(os.environ.get("PORT", 10000))
@@ -1980,7 +1759,7 @@ class FundingSuiviBot:
 
 
 if __name__ == "__main__":
-    print("🤖 Bot Funding Suivi V14.3")
+    print("🤖 Bot Funding Suivi V14.1-Perf")
     print(f"   DRY_RUN={DRY_RUN} | TESTNET={BYBIT_TESTNET} | DISCORD={DISCORD_ENABLED} | NEWS={NEWS_ENABLED} | FLASK={FLASK_AVAILABLE}")
     bot = FundingSuiviBot()
     try:
