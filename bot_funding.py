@@ -1,17 +1,15 @@
 # ==============================================================================
 # 📛 FICHIER : bot_funding.py
-# ✅ VERSION : V14.3 - V14.2 + Trailing dynamique + Break-Even
+# ✅ VERSION : V14.4 - V14.3 + Fix arrondi adaptatif + Cohérence bloquante + Sizing
 #
-#    Base : V14.2
-#    Nouveautés V14.3 :
-#    - 🆕 Break-Even intermédiaire : activé à +0.9%, SL posé à +0.3%
-#    - 🆕 Trailing à distance constante : seuil = trail_distance_pct - SL_pct
-#         (distance totale SL_initial → seuil trailing = 2.4% toujours)
-#    - 🆕 4 états de trade : Init → BE → Trail → TP (priorité croissante)
-#    - 🆕 Raison de sortie "BE" ajoutée
-#    - 🔥 Suppression de trail_seuil_gain_pct (remplacé par trail_distance_pct)
-#    - ✅ Sur SL serrés (<1.5%), le trailing peut ne jamais s'activer avant TP
-#         (comportement validé : l'état TP prend le relais)
+#    Base : V14.3
+#    Nouveautés V14.4 :
+#    - 🐛 FIX arrondi adaptatif : round_to_tick pour prix < 1$, round(x,4) sinon
+#         → Corrige l'écrasement SL/TP sur les petits alcoins (ex: BLAST 0.000398)
+#    - 🐛 FIX filtre cohérence BLOQUANT (retourne False au lieu de log-only)
+#    - 🐛 FIX sizing : max_notional basé sur self.capital (et non capital_libre)
+#         → Restaure la perf V14.0 (10% capital constant)
+#    - ✅ Compteur rejets renommé : "coherence" (au lieu de "coherence_log")
 # ==============================================================================
 
 import asyncio
@@ -91,17 +89,17 @@ GLOBAL_RISK_PARAMS = {
     "risk_per_trade": 0.005,
     "sl_max_pct": 1.2,
     "rr_ratio": 3.0,
-    "be_actif": True,                    # 🆕 V14.3 — Break-even activé
-    "be_seuil_gain_pct": 0.9,            # 🆕 V14.3 — BE activé à +0.9%
-    "be_sl_offset_pct": 0.3,             # 🆕 V14.3 — BE place SL à +0.3%
+    "be_actif": True,
+    "be_seuil_gain_pct": 0.9,
+    "be_sl_offset_pct": 0.3,
     "trail_actif": True,
-    # "trail_seuil_gain_pct": 1.2,       ← RETIRÉ V14.3 (obsolète)
-    "trail_distance_pct": 2.4,           # 🆕 V14.3 — distance SL_initial → seuil trailing
+    # "trail_seuil_gain_pct": 1.2,       ← RETIRÉ V14.3
+    "trail_distance_pct": 2.4,
     "trailing_atr_mult": 1.5,
     "min_sl_pct": 0.5,
     "max_trade_duration": 40 * 60,
-    "trail_buffer_pct": 0.6,             # SL buffer quand trailing actif
-    "tp_buffer_pct": 0.3,                # SL buffer quand TP atteint
+    "trail_buffer_pct": 0.6,
+    "tp_buffer_pct": 0.3,
     "momentum_bars_1m": 1,
     "momentum_bars_5m": 1,
     "structure_tolerance": 0.15,
@@ -110,9 +108,8 @@ GLOBAL_RISK_PARAMS = {
     "sl_update_min_interval": 5,
 }
 
-# Constantes V14.1-Perf conservées
 MIN_NOTIONAL_USD = 5.0
-MAX_NOTIONAL_PCT_LIBRE = 0.10
+MAX_NOTIONAL_PCT_LIBRE = 0.10   # ✅ V14.4 : appliqué sur self.capital (et non capital_libre)
 EXPO_MAX_PCT = 1.00
 
 CATEGORY_CONFIG = {
@@ -215,7 +212,7 @@ if FLASK_AVAILABLE:
             logger.error(f"❌ Erreur serveur HTTP: {e}", extra={'tier': 'GLOBAL'})
 
 # ============================
-# 🔐 BYBIT EXECUTOR (V14.3)
+# 🔐 BYBIT EXECUTOR (V14.4)
 # ============================
 class BybitExecutor:
     def __init__(self):
@@ -248,6 +245,17 @@ class BybitExecutor:
             return price
         tick = cls._tick_size_for(price)
         return round(round(price / tick) * tick, 8)
+
+    # 🆕 V14.4 — Arrondi adaptatif pour SL/TP logiques
+    #   - prix ≥ 1$ : round(x, 4) — comportement V14.0 préservé
+    #   - prix < 1$ : round_to_tick — évite l'écrasement sur petits alcoins
+    @classmethod
+    def round_to_tick_or_4dec(cls, price: float) -> float:
+        if price is None or price <= 0:
+            return price
+        if price >= 1.0:
+            return round(price, 4)
+        return cls.round_to_tick(price)
 
     def _sign(self, params: dict, timestamp: int) -> str:
         param_str = str(timestamp) + self.api_key + str(self.recv_window) + json.dumps(params, separators=(',', ':'))
@@ -742,7 +750,7 @@ class MarketAnalyzer:
 
 
 # ============================
-# 💼 TRADE MANAGER (V14.3)
+# 💼 TRADE MANAGER (V14.4)
 # ============================
 class Trade:
     def __init__(self, symbol, direction, entry_price, sl, tp, ts, atr, funding, score, ms, category="crypto"):
@@ -770,7 +778,6 @@ class Trade:
         self.trailing_multiplier = get_category_config(category)["risk"]["trailing_atr_mult"]
         self.exit_reason = None
         self.bybit_qty = 0.0
-        # 🆕 V14.3 — Seuils dynamiques calculés à l'ouverture
         self.initial_sl_pct = 0.0
         self.be_activation_pct = 0.0
         self.trail_activation_pct = 0.0
@@ -804,8 +811,8 @@ class TradeManager:
         self.daily_start_capital = initial_capital
         self.last_day = datetime.now().date()
         self.executor = executor
-        # 🆕 V14.3 — Compteurs de rejets (diagnostic)
-        self.rejets = {"coherence_log": 0, "notionnel": 0, "marge": 0, "expo": 0, "sl_non_confirme": 0}
+        # ✅ V14.4 — Compteur renommé (cohérence bloquante)
+        self.rejets = {"coherence": 0, "notionnel": 0, "marge": 0, "expo": 0, "sl_non_confirme": 0}
 
     def get_max_positions(self):
         return 20 if self.capital < 1000 else min(int(self.capital // 50), 50)
@@ -813,8 +820,9 @@ class TradeManager:
     def get_min_notional(self):
         return MIN_NOTIONAL_USD
 
+    # ✅ V14.4 — FIX SIZING : basé sur self.capital (Fix Cause N°1)
     def get_max_notional(self):
-        return round(self.capital_libre * MAX_NOTIONAL_PCT_LIBRE, 2) if self.capital < 1000 else 200.0
+        return round(self.capital * MAX_NOTIONAL_PCT_LIBRE, 2) if self.capital < 1000 else 200.0
 
     def get_exposition_max(self):
         return self.capital * EXPO_MAX_PCT
@@ -853,7 +861,7 @@ class TradeManager:
             extra={'tier': 'DIAG'}
         )
 
-        # ✅ V14.3 — Vérif cohérence SL/TP vs entry : LOG-ONLY
+        # ✅ V14.4 — Filtre cohérence BLOQUANT (Fix Cause N°2 - partie)
         coherence_ok = True
         if direction == "LONG":
             if not (sl < entry_price < tp):
@@ -863,12 +871,13 @@ class TradeManager:
                 coherence_ok = False
 
         if not coherence_ok:
-            self.rejets["coherence_log"] += 1
+            self.rejets["coherence"] += 1
             logger.warning(
-                f"⚠️ Incohérence SL/TP {symbol} {direction} "
-                f"SL={sl} entry={entry_price} TP={tp} — trade ouvert quand même (log only)",
+                f"⛔ Incohérence SL/TP {symbol} {direction} "
+                f"SL={sl} entry={entry_price} TP={tp} — trade REJETÉ",
                 extra={'tier': 'DIAG'}
             )
+            return False, f"Incohérence SL/TP: SL={sl} entry={entry_price} TP={tp}"
 
         notionnel = notionnel_plafonne
         if notionnel < self.get_min_notional() or notionnel > self.get_max_notional():
@@ -897,7 +906,6 @@ class TradeManager:
                 extra={'tier': 'BYBIT'}
             )
 
-            # Vérification + replacement SL (3 tentatives, 2s entre chaque)
             sl_ok = False
             for attempt in range(3):
                 await asyncio.sleep(2.0)
@@ -928,16 +936,12 @@ class TradeManager:
                         f"⚠️ **Position ouverte sans SL effectif — intervention manuelle**"
                     )
 
-        # Le Trade garde les valeurs LOGIQUES (non arrondies tick)
         trade = Trade(symbol, direction, entry_price, sl, tp, ts, atr, funding, score, ms, category)
         trade.notional = notionnel; trade.margin = marge; trade.size = qty; trade.bybit_qty = qty
 
-        # 🆕 V14.3 — Calcul des seuils dynamiques (BE + Trail)
         trail_distance = risk_cfg.get("trail_distance_pct", 2.4)
         trade.initial_sl_pct = sl_pct_effectif
         trade.be_activation_pct = risk_cfg.get("be_seuil_gain_pct", 0.9)
-        # Le trailing s'active quand la distance depuis le SL initial atteint trail_distance_pct
-        # → gain_pct nécessaire = trail_distance_pct - sl_pct_effectif
         trade.trail_activation_pct = max(0.1, trail_distance - sl_pct_effectif)
 
         logger.info(
@@ -954,17 +958,8 @@ class TradeManager:
         return True, "Position ouverte"
 
     # ============================================================
-    # 🎯 GESTION DES SORTIES — V14.3
-    # 4 ÉTATS (priorité croissante) :
-    #   ÉTAT 1 : Init      → SL initial
-    #   ÉTAT 2 : BE        → SL à entry ± 0.3% (activé à +0.9%)
-    #   ÉTAT 3 : Trail     → SL = pic × (1 ∓ 0.6%)
-    #                         (activé quand gain ≥ trail_distance - SL_pct)
-    #   ÉTAT 4 : TP atteint → SL = pic × (1 ∓ 0.3%) — IRRÉVERSIBLE
-    # Règles :
-    #   - Priorité TP > Trail > BE > Init (jamais de retour arrière)
-    #   - SL ne peut JAMAIS reculer
-    #   - Durée max : uniquement avant TP
+    # 🎯 GESTION DES SORTIES — V14.4 (identique V14.3)
+    # 4 ÉTATS : Init → BE → Trail → TP (priorité croissante)
     # ============================================================
     async def gerer_sorties(self, symbol, high, low, close, atr):
         trade = self.positions.get(symbol)
@@ -996,7 +991,7 @@ class TradeManager:
                         f"🎯 **TP ATTEINT** `{symbol}` — SL suit le pic à `{TP_BUFFER_PCT}%`"
                     )
 
-        # --- 2) DÉTECTION BREAK-EVEN (avant trailing) ---
+        # --- 2) DÉTECTION BREAK-EVEN ---
         if (not trade.tp_hit and not trade.be_active
             and trade.be_activation_pct > 0
             and gain_pct >= trade.be_activation_pct):
@@ -1007,7 +1002,7 @@ class TradeManager:
                 extra={'tier': 'TRADE'}
             )
 
-        # --- 3) DÉTECTION TRAILING (uniquement si TP pas atteint) ---
+        # --- 3) DÉTECTION TRAILING ---
         if (not trade.tp_hit and not trade.trail_active
             and trade.trail_activation_pct > 0
             and gain_pct >= trade.trail_activation_pct):
@@ -1025,21 +1020,18 @@ class TradeManager:
         old_sl = trade.stop_loss
 
         if trade.tp_hit:
-            # ÉTAT 4 — TP atteint (priorité maximale)
             if trade.direction == "LONG":
                 new_sl_candidate = trade.highest * (1 - TP_BUFFER_PCT / 100)
             else:
                 new_sl_candidate = trade.lowest * (1 + TP_BUFFER_PCT / 100)
 
         elif trade.trail_active:
-            # ÉTAT 3 — Trailing actif
             if trade.direction == "LONG":
                 new_sl_candidate = trade.highest * (1 - TRAIL_BUFFER_PCT / 100)
             else:
                 new_sl_candidate = trade.lowest * (1 + TRAIL_BUFFER_PCT / 100)
 
         elif trade.be_active:
-            # ÉTAT 2 — Break-even (SL à entry ± offset)
             if trade.direction == "LONG":
                 new_sl_candidate = trade.entry_price * (1 + BE_SL_OFFSET / 100)
             else:
@@ -1225,7 +1217,6 @@ class TradeManager:
                 risk_cfg = get_category_config(category)["risk"]
                 trail_mult = risk_cfg["trailing_atr_mult"]
 
-                # 🆕 V14.3 — Fallback sur min_sl_pct (Point 3-A validé)
                 sl_pct_fallback = risk_cfg["min_sl_pct"]
                 trail_distance = risk_cfg.get("trail_distance_pct", 2.4)
 
@@ -1243,7 +1234,6 @@ class TradeManager:
                 trade.lowest = entry
                 trade.trailing_multiplier = trail_mult
 
-                # 🆕 V14.3 — Seuils avec fallback
                 trade.initial_sl_pct = sl_pct_fallback
                 trade.be_activation_pct = risk_cfg.get("be_seuil_gain_pct", 0.9)
                 trade.trail_activation_pct = max(0.1, trail_distance - sl_pct_fallback)
@@ -1261,7 +1251,7 @@ class TradeManager:
                 logger.error(f"⚠️ Reconstruction position échouée ({p.get('symbol','?')}): {e}",
                              extra={'tier': 'BYBIT'})
 # ============================
-# 🤖 BOT PRINCIPAL (V14.3 — SÉQUENTIEL)
+# 🤖 BOT PRINCIPAL (V14.4 — SÉQUENTIEL)
 # ============================
 class FundingSuiviBot:
     def __init__(self):
@@ -1356,7 +1346,6 @@ class FundingSuiviBot:
         )
 
         if level is None:
-            # CAS 3 : aucun niveau dans la fourchette acceptée
             pending_level, pending_name, pending_dist = pending_info
             if risk_cfg.get("fallback_si_aucun_niveau", False):
                 sl_pct = risk_cfg["sl_max_pct"]
@@ -1375,7 +1364,6 @@ class FundingSuiviBot:
                     "struct_type": None
                 }
         else:
-            # CAS 2 : intérieur à la zone → SL forcé au minimum
             if type_niveau and "(int)" in type_niveau:
                 sl_pct = risk_cfg["min_sl_pct"]
                 if direction == "LONG":
@@ -1385,7 +1373,6 @@ class FundingSuiviBot:
                 struct_distance_pct = sl_pct
                 pending_level = None
             else:
-                # CAS 1 : normal → SL au niveau ± 0.3%
                 if direction == "LONG": sl = level * 0.997
                 else: sl = level * 1.003
                 sl_pct = abs(entry_price - sl) / entry_price * 100
@@ -1400,12 +1387,13 @@ class FundingSuiviBot:
             trail_pct = sl_pct * 0.75
         ts = entry_price * (1 - trail_pct/100) if direction == "LONG" else entry_price * (1 + trail_pct/100)
 
-        # ✅ V14.3 — Retour identique V14.0 (round 4 déc.)
-        # L'arrondi tick se fera UNIQUEMENT à l'envoi Bybit dans ouvrir_position
+        # ✅ V14.4 — FIX ARRONDI : round_to_tick_or_4dec (Cause N°2)
+        #   - prix ≥ 1$ : round(x, 4) — identique V14.0
+        #   - prix < 1$ : round_to_tick — évite l'écrasement SL/TP sur petits alcoins
         return {
-            "sl": round(sl, 4),
-            "tp": round(tp, 4),
-            "ts": round(ts, 4),
+            "sl": BybitExecutor.round_to_tick_or_4dec(sl),
+            "tp": BybitExecutor.round_to_tick_or_4dec(tp),
+            "ts": BybitExecutor.round_to_tick_or_4dec(ts),
             "sl_pct": round(sl_pct, 2), "tp_pct": round(tp_pct, 2),
             "atr": round(atr, 4) if atr else 0,
             "support": support, "resistance": resistance,
@@ -1421,8 +1409,10 @@ class FundingSuiviBot:
         sl = entry_price * (1 - sl_pct/100) if direction == "LONG" else entry_price * (1 + sl_pct/100)
         tp = entry_price * (1 + tp_pct/100) if direction == "LONG" else entry_price * (1 - tp_pct/100)
         ts = sl
-        # ✅ V14.3 — Retour identique V14.0
-        return {"sl": round(sl, 4), "tp": round(tp, 4), "ts": round(ts, 4),
+        # ✅ V14.4 — FIX ARRONDI
+        return {"sl": BybitExecutor.round_to_tick_or_4dec(sl),
+                "tp": BybitExecutor.round_to_tick_or_4dec(tp),
+                "ts": BybitExecutor.round_to_tick_or_4dec(ts),
                 "sl_pct": sl_pct, "tp_pct": tp_pct, "atr": 0,
                 "support": 0, "resistance": 0, "struct_distance_pct": None,
                 "pending_level": None, "pending_name": None, "pending_dist": None,
@@ -1521,7 +1511,7 @@ class FundingSuiviBot:
                         if DISCORD_ENABLED and notifier:
                             await notifier.send(
                                 f"✅ **PENDING OUVERTURE {direction}({short_label})** `{sym}` @ `{current_price:.4f}`\n"
-                                f"SL: `{sltp['sl']:.4f}` ({sltp['sl_pct']:.2f}%) | TP: `{sltp['tp']:.4f}`"
+                                f"SL: `{sltp['sl']:.6f}` ({sltp['sl_pct']:.2f}%) | TP: `{sltp['tp']:.6f}`"
                             )
                     to_remove.append(sym)
             elif direction == "SHORT" and level * 0.999 <= current_price <= level * 1.001:
@@ -1539,13 +1529,12 @@ class FundingSuiviBot:
                         if DISCORD_ENABLED and notifier:
                             await notifier.send(
                                 f"✅ **PENDING OUVERTURE {direction}({short_label})** `{sym}` @ `{current_price:.4f}`\n"
-                                f"SL: `{sltp['sl']:.4f}` ({sltp['sl_pct']:.2f}%) | TP: `{sltp['tp']:.4f}`"
+                                f"SL: `{sltp['sl']:.6f}` ({sltp['sl_pct']:.2f}%) | TP: `{sltp['tp']:.6f}`"
                             )
                     to_remove.append(sym)
         for sym in to_remove: self.pending_entries.pop(sym, None)
 
     async def scan_and_trade(self):
-        # Vérification Forex
         forex_blocked, forex_reason = self.is_forex_open_blackout()
         if forex_blocked:
             now = time.time()
@@ -1559,7 +1548,6 @@ class FundingSuiviBot:
                     await notifier.send(msg)
             return
 
-        # Vérification news
         blocked, event = self.is_news_blocked()
         if blocked:
             now = time.time()
@@ -1740,9 +1728,9 @@ class FundingSuiviBot:
             btc_regime = await self.get_btc_regime()
             mode = "LIVE" if self.executor else "DRY"
             logger.info(f"=== DÉTAIL [{mode}] === BTC: {btc_regime} | Capital: {m['capital']}$ Libre: {m['capital_libre']}$ Expo: {m['exposition_pct']}% DD: {m['drawdown_max']}%")
-            # 🆕 V14.3 — Stats rejets
+            # ✅ V14.4 — Compteur renommé : "coherence" (au lieu de "coherence_log")
             r = self.trade_manager.rejets
-            logger.info(f"🚫 Rejets cumulés — Cohérence(log): {r['coherence_log']} | Notionnel: {r['notionnel']} | Marge: {r['marge']} | Expo: {r['expo']} | SL non confirmé: {r['sl_non_confirme']}")
+            logger.info(f"🚫 Rejets cumulés — Cohérence: {r['coherence']} | Notionnel: {r['notionnel']} | Marge: {r['marge']} | Expo: {r['expo']} | SL non confirmé: {r['sl_non_confirme']}")
             if self.trade_manager.positions:
                 rows = []
                 for sym, t in self.trade_manager.positions.items():
@@ -1773,7 +1761,7 @@ class FundingSuiviBot:
 
     async def run(self):
         mode = "LIVE (Testnet)" if BYBIT_TESTNET else ("LIVE (Mainnet)" if not DRY_RUN else "DRY_RUN")
-        logger.info(f"🚀 Bot Funding Suivi V14.3 démarré - Mode: {mode}")
+        logger.info(f"🚀 Bot Funding Suivi V14.4 démarré - Mode: {mode}")
 
         if FLASK_AVAILABLE:
             port = int(os.environ.get("PORT", 10000))
@@ -1853,7 +1841,7 @@ class FundingSuiviBot:
 
 
 if __name__ == "__main__":
-    print("🤖 Bot Funding Suivi V14.3")
+    print("🤖 Bot Funding Suivi V14.4")
     print(f"   DRY_RUN={DRY_RUN} | TESTNET={BYBIT_TESTNET} | DISCORD={DISCORD_ENABLED} | NEWS={NEWS_ENABLED} | FLASK={FLASK_AVAILABLE}")
     bot = FundingSuiviBot()
     try:
