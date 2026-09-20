@@ -90,7 +90,7 @@ GLOBAL_RISK_PARAMS = {
     "sl_max_pct": 1.2,
     "rr_ratio": 3.0,
     "be_actif": True,
-    "be_seuil_gain_pct": 0.9,
+    "be_seuil_gain_pct": 1.2,
     "be_sl_offset_pct": 0.3,
     "trail_actif": True,
     # "trail_seuil_gain_pct": 1.2,       ← RETIRÉ V14.3
