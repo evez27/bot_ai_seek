@@ -1,15 +1,26 @@
 # ==============================================================================
 # 📛 FICHIER : bot_funding.py
-# ✅ VERSION : V14.4 - V14.3 + Fix arrondi adaptatif + Cohérence bloquante + Sizing
+# ✅ VERSION : V14.5 - V14.0 + matelas SL + fixes V14.4
 #
-#    Base : V14.3
-#    Nouveautés V14.4 :
-#    - 🐛 FIX arrondi adaptatif : round_to_tick pour prix < 1$, round(x,4) sinon
-#         → Corrige l'écrasement SL/TP sur les petits alcoins (ex: BLAST 0.000398)
-#    - 🐛 FIX filtre cohérence BLOQUANT (retourne False au lieu de log-only)
-#    - 🐛 FIX sizing : max_notional basé sur self.capital (et non capital_libre)
-#         → Restaure la perf V14.0 (10% capital constant)
-#    - ✅ Compteur rejets renommé : "coherence" (au lieu de "coherence_log")
+#    Logique décisionnelle : IDENTIQUE V14.0
+#    Sauf un changement unique :
+#      - 🆕 Plancher SL à entry ± 0.3% (au lieu de entry pur / break-even)
+#         appliqué au moment du trail activé ET du TP atteint
+#
+#    Acquis V14.4 conservés :
+#      - ✅ Sizing : 10% du capital (et non capital_libre)
+#      - ✅ Arrondi adaptatif (round_to_tick_or_4dec) pour prix < 1$
+#      - ✅ Filtre cohérence SL/TP BLOQUANT
+#      - ✅ round_to_tick à l'envoi Bybit uniquement
+#      - ✅ verify_sl_active + force_set_sl (post-ouverture LIVE)
+#      - ✅ flush_pending_sl
+#      - ✅ Reconstruction positions au restart
+#      - ✅ Compteur rejets
+#
+#    Configs :
+#      - trail_seuil_gain_pct = 1.2   (V14.0)
+#      - trailing_step_pct = 0.3      (V14.0)
+#      - sl_floor_offset_pct = 0.3    (🆕 matelas BE)
 # ==============================================================================
 
 import asyncio
@@ -89,17 +100,15 @@ GLOBAL_RISK_PARAMS = {
     "risk_per_trade": 0.005,
     "sl_max_pct": 1.2,
     "rr_ratio": 3.0,
-    "be_actif": True,
-    "be_seuil_gain_pct": 1.2,
-    "be_sl_offset_pct": 0.3,
+    # ✅ V14.5 — Retour aux paramètres V14.0
     "trail_actif": True,
-    # "trail_seuil_gain_pct": 1.2,       ← RETIRÉ V14.3
-    "trail_distance_pct": 2.4,
+    "trail_seuil_gain_pct": 1.2,       # Trail activé à +1.2%
     "trailing_atr_mult": 1.5,
     "min_sl_pct": 0.5,
     "max_trade_duration": 40 * 60,
-    "trail_buffer_pct": 0.6,
-    "tp_buffer_pct": 0.3,
+    "trailing_step_pct": 0.3,          # Pas du trail continu
+    # 🆕 V14.5 — Matelas SL unique
+    "sl_floor_offset_pct": 0.3,        # Plancher SL à entry ± 0.3%
     "momentum_bars_1m": 1,
     "momentum_bars_5m": 1,
     "structure_tolerance": 0.15,
@@ -109,7 +118,7 @@ GLOBAL_RISK_PARAMS = {
 }
 
 MIN_NOTIONAL_USD = 5.0
-MAX_NOTIONAL_PCT_LIBRE = 0.10   # ✅ V14.4 : appliqué sur self.capital (et non capital_libre)
+MAX_NOTIONAL_PCT_LIBRE = 0.10   # ✅ V14.4 : appliqué sur self.capital
 EXPO_MAX_PCT = 1.00
 
 CATEGORY_CONFIG = {
@@ -126,7 +135,9 @@ CATEGORY_CONFIG = {
     },
     "forex": {
         "risk": {**GLOBAL_RISK_PARAMS, "sl_max_pct": 0.5, "rr_ratio": 2.5,
-                 "trailing_atr_mult": 1.2, "max_trade_duration": 120*60, "min_sl_pct": 0.2},
+                 "trail_seuil_gain_pct": 0.6, "trailing_atr_mult": 1.2,
+                 "max_trade_duration": 120*60, "min_sl_pct": 0.2,
+                 "trailing_step_pct": 0.1},
         "indicators": {"vwap_period": 20, "adx_min": 12, "atr_min_pct": 0.02, "volume_confirm_min": 1.5,
                        "funding_seuil_base": 0.02, "funding_percentile_min": 80, "volume_min_24h": 100_000,
                        "adaptative": {"vwap_vol_base": 0.2, "vwap_fenetre_min": 8, "vwap_fenetre_max": 40,
@@ -135,7 +146,9 @@ CATEGORY_CONFIG = {
     },
     "metal": {
         "risk": {**GLOBAL_RISK_PARAMS, "sl_max_pct": 0.8, "rr_ratio": 2.0,
-                 "trailing_atr_mult": 1.3, "max_trade_duration": 60*60, "min_sl_pct": 0.3},
+                 "trail_seuil_gain_pct": 0.8, "trailing_atr_mult": 1.3,
+                 "max_trade_duration": 60*60, "min_sl_pct": 0.3,
+                 "trailing_step_pct": 0.2},
         "indicators": {"vwap_period": 15, "adx_min": 12, "atr_min_pct": 0.05, "volume_confirm_min": 1.2,
                        "funding_seuil_base": 0.05, "funding_percentile_min": 75, "volume_min_24h": 100_000,
                        "adaptative": {"vwap_vol_base": 0.5, "vwap_fenetre_min": 5, "vwap_fenetre_max": 30,
@@ -144,7 +157,9 @@ CATEGORY_CONFIG = {
     },
     "energie": {
         "risk": {**GLOBAL_RISK_PARAMS, "sl_max_pct": 1.0, "rr_ratio": 2.5,
-                 "trailing_atr_mult": 1.4, "max_trade_duration": 60*60, "min_sl_pct": 0.4},
+                 "trail_seuil_gain_pct": 1.0, "trailing_atr_mult": 1.4,
+                 "max_trade_duration": 60*60, "min_sl_pct": 0.4,
+                 "trailing_step_pct": 0.2},
         "indicators": {"vwap_period": 15, "adx_min": 12, "atr_min_pct": 0.05, "volume_confirm_min": 1.2,
                        "funding_seuil_base": 0.05, "funding_percentile_min": 75, "volume_min_24h": 100_000,
                        "adaptative": {"vwap_vol_base": 0.6, "vwap_fenetre_min": 5, "vwap_fenetre_max": 30,
@@ -153,7 +168,9 @@ CATEGORY_CONFIG = {
     },
     "indice": {
         "risk": {**GLOBAL_RISK_PARAMS, "sl_max_pct": 0.6, "rr_ratio": 2.5,
-                 "trailing_atr_mult": 1.2, "max_trade_duration": 120*60, "min_sl_pct": 0.2},
+                 "trail_seuil_gain_pct": 0.6, "trailing_atr_mult": 1.2,
+                 "max_trade_duration": 120*60, "min_sl_pct": 0.2,
+                 "trailing_step_pct": 0.1},
         "indicators": {"vwap_period": 20, "adx_min": 12, "atr_min_pct": 0.03, "volume_confirm_min": 1.5,
                        "funding_seuil_base": 0.03, "funding_percentile_min": 80, "volume_min_24h": 200_000,
                        "adaptative": {"vwap_vol_base": 0.3, "vwap_fenetre_min": 8, "vwap_fenetre_max": 40,
@@ -162,7 +179,9 @@ CATEGORY_CONFIG = {
     },
     "action": {
         "risk": {**GLOBAL_RISK_PARAMS, "sl_max_pct": 1.0, "rr_ratio": 2.5,
-                 "trailing_atr_mult": 1.3, "max_trade_duration": 90*60, "min_sl_pct": 0.3},
+                 "trail_seuil_gain_pct": 0.8, "trailing_atr_mult": 1.3,
+                 "max_trade_duration": 90*60, "min_sl_pct": 0.3,
+                 "trailing_step_pct": 0.2},
         "indicators": {"vwap_period": 15, "adx_min": 12, "atr_min_pct": 0.03, "volume_confirm_min": 1.3,
                        "funding_seuil_base": 0.05, "funding_percentile_min": 75, "volume_min_24h": 100_000,
                        "adaptative": {"vwap_vol_base": 0.7, "vwap_fenetre_min": 5, "vwap_fenetre_max": 30,
@@ -212,7 +231,7 @@ if FLASK_AVAILABLE:
             logger.error(f"❌ Erreur serveur HTTP: {e}", extra={'tier': 'GLOBAL'})
 
 # ============================
-# 🔐 BYBIT EXECUTOR (V14.4)
+# 🔐 BYBIT EXECUTOR (V14.5)
 # ============================
 class BybitExecutor:
     def __init__(self):
@@ -246,9 +265,7 @@ class BybitExecutor:
         tick = cls._tick_size_for(price)
         return round(round(price / tick) * tick, 8)
 
-    # 🆕 V14.4 — Arrondi adaptatif pour SL/TP logiques
-    #   - prix ≥ 1$ : round(x, 4) — comportement V14.0 préservé
-    #   - prix < 1$ : round_to_tick — évite l'écrasement sur petits alcoins
+    # ✅ V14.4 — Arrondi adaptatif (conservé V14.5)
     @classmethod
     def round_to_tick_or_4dec(cls, price: float) -> float:
         if price is None or price <= 0:
@@ -750,7 +767,7 @@ class MarketAnalyzer:
 
 
 # ============================
-# 💼 TRADE MANAGER (V14.4)
+# 💼 TRADE MANAGER (V14.5 — logique V14.0 + matelas 0.3%)
 # ============================
 class Trade:
     def __init__(self, symbol, direction, entry_price, sl, tp, ts, atr, funding, score, ms, category="crypto"):
@@ -778,9 +795,6 @@ class Trade:
         self.trailing_multiplier = get_category_config(category)["risk"]["trailing_atr_mult"]
         self.exit_reason = None
         self.bybit_qty = 0.0
-        self.initial_sl_pct = 0.0
-        self.be_activation_pct = 0.0
-        self.trail_activation_pct = 0.0
 
     def update_extremes(self, high, low):
         self.highest = max(self.highest, high)
@@ -811,7 +825,6 @@ class TradeManager:
         self.daily_start_capital = initial_capital
         self.last_day = datetime.now().date()
         self.executor = executor
-        # ✅ V14.4 — Compteur renommé (cohérence bloquante)
         self.rejets = {"coherence": 0, "notionnel": 0, "marge": 0, "expo": 0, "sl_non_confirme": 0}
 
     def get_max_positions(self):
@@ -820,7 +833,7 @@ class TradeManager:
     def get_min_notional(self):
         return MIN_NOTIONAL_USD
 
-    # ✅ V14.4 — FIX SIZING : basé sur self.capital (Fix Cause N°1)
+    # ✅ V14.4 — FIX SIZING : basé sur self.capital (V14.0)
     def get_max_notional(self):
         return round(self.capital * MAX_NOTIONAL_PCT_LIBRE, 2) if self.capital < 1000 else 200.0
 
@@ -861,7 +874,7 @@ class TradeManager:
             extra={'tier': 'DIAG'}
         )
 
-        # ✅ V14.4 — Filtre cohérence BLOQUANT (Fix Cause N°2 - partie)
+        # ✅ V14.4 — Filtre cohérence BLOQUANT
         coherence_ok = True
         if direction == "LONG":
             if not (sl < entry_price < tp):
@@ -938,28 +951,16 @@ class TradeManager:
 
         trade = Trade(symbol, direction, entry_price, sl, tp, ts, atr, funding, score, ms, category)
         trade.notional = notionnel; trade.margin = marge; trade.size = qty; trade.bybit_qty = qty
-
-        trail_distance = risk_cfg.get("trail_distance_pct", 2.4)
-        trade.initial_sl_pct = sl_pct_effectif
-        trade.be_activation_pct = risk_cfg.get("be_seuil_gain_pct", 0.9)
-        trade.trail_activation_pct = max(0.1, trail_distance - sl_pct_effectif)
-
-        logger.info(
-            f"📐 Seuils {symbol} | SL={sl_pct_effectif:.2f}% | "
-            f"BE @ {trade.be_activation_pct:.2f}% | "
-            f"Trail @ {trade.trail_activation_pct:.2f}% "
-            f"(dist cible {trail_distance}% - SL {sl_pct_effectif:.2f}%)",
-            extra={'tier': 'TRADE'}
-        )
-
         self.capital_libre -= marge
         self.positions[symbol] = trade
         self.stats["total_trades"] += 1
         return True, "Position ouverte"
 
     # ============================================================
-    # 🎯 GESTION DES SORTIES — V14.4 (identique V14.3)
-    # 4 ÉTATS : Init → BE → Trail → TP (priorité croissante)
+    # 🎯 GESTION DES SORTIES — V14.5
+    # Logique V14.0 avec UNE modification :
+    #   Plancher SL = entry ± sl_floor_offset_pct (au lieu de entry pur)
+    #   Appliqué : trail activé + TP atteint
     # ============================================================
     async def gerer_sorties(self, symbol, high, low, close, atr):
         trade = self.positions.get(symbol)
@@ -970,105 +971,64 @@ class TradeManager:
         trade.update_extremes(high, low)
         gain_pct = trade.gain_pct()
 
-        TRAIL_BUFFER_PCT = risk_cfg.get("trail_buffer_pct", 0.6)
-        TP_BUFFER_PCT    = risk_cfg.get("tp_buffer_pct", 0.3)
-        BE_SL_OFFSET     = risk_cfg.get("be_sl_offset_pct", 0.3)
+        SL_FLOOR_OFFSET = risk_cfg.get("sl_floor_offset_pct", 0.3)
 
-        # --- 1) DÉTECTION TP (priorité absolue, irréversible) ---
-        if not trade.tp_hit:
-            tp_touched = (
-                (trade.direction == "LONG"  and high >= trade.take_profit) or
-                (trade.direction == "SHORT" and low  <= trade.take_profit)
-            )
-            if tp_touched:
-                trade.tp_hit = True
-                logger.info(
-                    f"🎯 TP atteint {symbol} | Passage ÉTAT 4 (TP) → SL buffer {TP_BUFFER_PCT}%",
-                    extra={'tier': 'TRADE'}
-                )
-                if DISCORD_ENABLED and notifier:
-                    await notifier.send(
-                        f"🎯 **TP ATTEINT** `{symbol}` — SL suit le pic à `{TP_BUFFER_PCT}%`"
-                    )
+        # Plancher SL (V14.0 → entry pur, V14.5 → entry ± 0.3%)
+        if trade.direction == "LONG":
+            sl_floor = trade.entry_price * (1 + SL_FLOOR_OFFSET / 100)
+        else:
+            sl_floor = trade.entry_price * (1 - SL_FLOOR_OFFSET / 100)
 
-        # --- 2) DÉTECTION BREAK-EVEN ---
-        if (not trade.tp_hit and not trade.be_active
-            and trade.be_activation_pct > 0
-            and gain_pct >= trade.be_activation_pct):
-            trade.be_active = True
-            logger.info(
-                f"🛡️ BE activé {symbol} | Gain {gain_pct:.2f}% ≥ seuil {trade.be_activation_pct:.2f}% "
-                f"→ SL posé à +{BE_SL_OFFSET}%",
-                extra={'tier': 'TRADE'}
-            )
-
-        # --- 3) DÉTECTION TRAILING ---
-        if (not trade.tp_hit and not trade.trail_active
-            and trade.trail_activation_pct > 0
-            and gain_pct >= trade.trail_activation_pct):
+        # --- 1) TRAILING ACTIVATION (V14.0) ---
+        if risk_cfg.get("trail_actif", True) and not trade.trail_active and gain_pct >= risk_cfg["trail_seuil_gain_pct"]:
             trade.trail_active = True
-            logger.info(
-                f"🚀 Trail activé {symbol} | Gain {gain_pct:.2f}% ≥ seuil "
-                f"{trade.trail_activation_pct:.2f}% "
-                f"(SL init {trade.initial_sl_pct:.2f}% + distance) "
-                f"→ SL buffer {TRAIL_BUFFER_PCT}% du pic",
-                extra={'tier': 'TRADE'}
-            )
-
-        # --- 4) CALCUL DU NOUVEAU SL (par priorité d'état) ---
-        new_sl_candidate = None
-        old_sl = trade.stop_loss
-
-        if trade.tp_hit:
             if trade.direction == "LONG":
-                new_sl_candidate = trade.highest * (1 - TP_BUFFER_PCT / 100)
+                new_sl = trade.highest * (1 - risk_cfg["trail_seuil_gain_pct"] / 100)
+                trade.stop_loss = max(trade.stop_loss, sl_floor, new_sl)   # 🆕 sl_floor au lieu de entry
             else:
-                new_sl_candidate = trade.lowest * (1 + TP_BUFFER_PCT / 100)
+                new_sl = trade.lowest * (1 + risk_cfg["trail_seuil_gain_pct"] / 100)
+                trade.stop_loss = min(trade.stop_loss, sl_floor, new_sl)   # 🆕 sl_floor au lieu de entry
+            logger.info(f"🚀 Trailing activé {symbol} | SL -> {trade.stop_loss:.6f} (plancher {sl_floor:.6f})")
+            if self.executor is not None:
+                await self.executor.set_trading_stop(symbol, trade.stop_loss)
 
-        elif trade.trail_active:
+        # --- 2) TRAILING CONTINU (V14.0) ---
+        if trade.trail_active:
+            step_pct = risk_cfg.get("trailing_step_pct", 0.3) / 100.0
+            old_sl = trade.stop_loss
             if trade.direction == "LONG":
-                new_sl_candidate = trade.highest * (1 - TRAIL_BUFFER_PCT / 100)
+                new_stop = trade.highest * (1 - step_pct)
+                if new_stop > trade.stop_loss:
+                    trade.stop_loss = new_stop
             else:
-                new_sl_candidate = trade.lowest * (1 + TRAIL_BUFFER_PCT / 100)
-
-        elif trade.be_active:
-            if trade.direction == "LONG":
-                new_sl_candidate = trade.entry_price * (1 + BE_SL_OFFSET / 100)
-            else:
-                new_sl_candidate = trade.entry_price * (1 - BE_SL_OFFSET / 100)
-
-        # --- 5) APPLICATION avec non-régression stricte ---
-        if new_sl_candidate is not None:
-            if trade.direction == "LONG":
-                trade.stop_loss = max(trade.stop_loss, new_sl_candidate)
-            else:
-                trade.stop_loss = min(trade.stop_loss, new_sl_candidate)
-
+                new_stop = trade.lowest * (1 + step_pct)
+                if new_stop < trade.stop_loss:
+                    trade.stop_loss = new_stop
             if self.executor is not None and abs(trade.stop_loss - old_sl) > 1e-9:
                 await self.executor.set_trading_stop(symbol, trade.stop_loss)
 
-        # --- 6) DÉTECTION SORTIE ---
-        sortie = False
-        prix_sortie = None
-        raison = None
+        # --- 3) TP (V14.0 + matelas 0.3%) ---
+        if not trade.tp_hit:
+            if (trade.direction == "LONG" and high >= trade.take_profit) or (trade.direction == "SHORT" and low <= trade.take_profit):
+                trade.tp_hit = True
+                if trade.direction == "LONG":
+                    trade.stop_loss = max(trade.stop_loss, sl_floor)   # 🆕 sl_floor au lieu de entry
+                else:
+                    trade.stop_loss = min(trade.stop_loss, sl_floor)   # 🆕 sl_floor au lieu de entry
+                logger.info(f"🎯 TP atteint {symbol} | SL verrouillé plancher -> {trade.stop_loss:.6f}")
+                if self.executor is not None:
+                    await self.executor.set_trading_stop(symbol, trade.stop_loss)
 
-        if ((trade.direction == "LONG"  and low  <= trade.stop_loss) or
-            (trade.direction == "SHORT" and high >= trade.stop_loss)):
-            prix_sortie = trade.stop_loss
-            sortie = True
-            if trade.tp_hit:
-                raison = "TP-Trail"
-            elif trade.trail_active:
-                raison = "Trail"
-            elif trade.be_active:
-                raison = "BE"
-            else:
-                raison = "SL"
-
-        elif (not trade.tp_hit) and (time.time() - trade.entry_time > risk_cfg["max_trade_duration"]):
-            prix_sortie = close
-            sortie = True
-            raison = "Échéance"
+        # --- 4) SORTIE (V14.0) ---
+        sortie = False; prix_sortie = None; raison = None
+        if (trade.direction == "LONG" and low <= trade.stop_loss) or (trade.direction == "SHORT" and high >= trade.stop_loss):
+            prix_sortie = trade.stop_loss; sortie = True
+            if abs(trade.stop_loss - trade.initial_sl) < 1e-9: raison = "SL"
+            elif trade.tp_hit: raison = "TP"
+            elif trade.trail_active: raison = "Trail"
+            else: raison = "SL"
+        elif time.time() - trade.entry_time > risk_cfg["max_trade_duration"] and not trade.tp_hit:
+            prix_sortie = close; sortie = True; raison = "Échéance"
 
         if sortie:
             trade.exit_reason = raison
@@ -1217,9 +1177,6 @@ class TradeManager:
                 risk_cfg = get_category_config(category)["risk"]
                 trail_mult = risk_cfg["trailing_atr_mult"]
 
-                sl_pct_fallback = risk_cfg["min_sl_pct"]
-                trail_distance = risk_cfg.get("trail_distance_pct", 2.4)
-
                 trade = Trade(symbol, direction, entry, sl, tp, sl, 0, 0, 0, {}, category)
                 trade.stop_loss = sl if sl > 0 else (
                     entry * (1 - risk_cfg["min_sl_pct"] / 100) if direction == "LONG"
@@ -1233,25 +1190,18 @@ class TradeManager:
                 trade.highest = entry
                 trade.lowest = entry
                 trade.trailing_multiplier = trail_mult
-
-                trade.initial_sl_pct = sl_pct_fallback
-                trade.be_activation_pct = risk_cfg.get("be_seuil_gain_pct", 0.9)
-                trade.trail_activation_pct = max(0.1, trail_distance - sl_pct_fallback)
-
                 self.positions[symbol] = trade
 
                 logger.info(
                     f"🔄 Position reconstruite: {symbol} {direction} @ {entry} "
-                    f"size={size} SL={sl} TP={tp} cat={category} | "
-                    f"BE @ {trade.be_activation_pct:.2f}% | "
-                    f"Trail @ {trade.trail_activation_pct:.2f}% (fallback min_sl_pct={sl_pct_fallback})",
+                    f"size={size} SL={sl} TP={tp} cat={category}",
                     extra={'tier': 'BYBIT'}
                 )
             except Exception as e:
                 logger.error(f"⚠️ Reconstruction position échouée ({p.get('symbol','?')}): {e}",
                              extra={'tier': 'BYBIT'})
 # ============================
-# 🤖 BOT PRINCIPAL (V14.4 — SÉQUENTIEL)
+# 🤖 BOT PRINCIPAL (V14.5 — Logique V14.0 + matelas 0.3%)
 # ============================
 class FundingSuiviBot:
     def __init__(self):
@@ -1387,9 +1337,7 @@ class FundingSuiviBot:
             trail_pct = sl_pct * 0.75
         ts = entry_price * (1 - trail_pct/100) if direction == "LONG" else entry_price * (1 + trail_pct/100)
 
-        # ✅ V14.4 — FIX ARRONDI : round_to_tick_or_4dec (Cause N°2)
-        #   - prix ≥ 1$ : round(x, 4) — identique V14.0
-        #   - prix < 1$ : round_to_tick — évite l'écrasement SL/TP sur petits alcoins
+        # ✅ V14.4 — Arrondi adaptatif conservé en V14.5
         return {
             "sl": BybitExecutor.round_to_tick_or_4dec(sl),
             "tp": BybitExecutor.round_to_tick_or_4dec(tp),
@@ -1409,7 +1357,6 @@ class FundingSuiviBot:
         sl = entry_price * (1 - sl_pct/100) if direction == "LONG" else entry_price * (1 + sl_pct/100)
         tp = entry_price * (1 + tp_pct/100) if direction == "LONG" else entry_price * (1 - tp_pct/100)
         ts = sl
-        # ✅ V14.4 — FIX ARRONDI
         return {"sl": BybitExecutor.round_to_tick_or_4dec(sl),
                 "tp": BybitExecutor.round_to_tick_or_4dec(tp),
                 "ts": BybitExecutor.round_to_tick_or_4dec(ts),
@@ -1728,7 +1675,6 @@ class FundingSuiviBot:
             btc_regime = await self.get_btc_regime()
             mode = "LIVE" if self.executor else "DRY"
             logger.info(f"=== DÉTAIL [{mode}] === BTC: {btc_regime} | Capital: {m['capital']}$ Libre: {m['capital_libre']}$ Expo: {m['exposition_pct']}% DD: {m['drawdown_max']}%")
-            # ✅ V14.4 — Compteur renommé : "coherence" (au lieu de "coherence_log")
             r = self.trade_manager.rejets
             logger.info(f"🚫 Rejets cumulés — Cohérence: {r['coherence']} | Notionnel: {r['notionnel']} | Marge: {r['marge']} | Expo: {r['expo']} | SL non confirmé: {r['sl_non_confirme']}")
             if self.trade_manager.positions:
@@ -1743,11 +1689,10 @@ class FundingSuiviBot:
                     else:
                         etat = "Init"
                     rows.append([sym, t.direction, t.entry_price, t.stop_loss, t.take_profit,
-                                 etat, f"{t.be_activation_pct:.1f}%",
-                                 f"{t.trail_activation_pct:.2f}%",
+                                 etat,
                                  round((time.time()-t.entry_time)/60,1), t.score, t.category])
                 logger.info("\n📋 POSITIONS OUVERTES:\n" + tabulate(rows,
-                    headers=["Sym","Sens","Prix","SL","TP","État","Seuil BE","Seuil Trail","Âge(min)","Score","Cat"],
+                    headers=["Sym","Sens","Prix","SL","TP","État","Âge(min)","Score","Cat"],
                     tablefmt="grid"))
             if self.trade_manager.closed_trades:
                 rows = [[t["symbol"], t["direction"], t["entry_time"], t["exit_time"],
@@ -1761,7 +1706,7 @@ class FundingSuiviBot:
 
     async def run(self):
         mode = "LIVE (Testnet)" if BYBIT_TESTNET else ("LIVE (Mainnet)" if not DRY_RUN else "DRY_RUN")
-        logger.info(f"🚀 Bot Funding Suivi V14.4 démarré - Mode: {mode}")
+        logger.info(f"🚀 Bot Funding Suivi V14.5 démarré - Mode: {mode}")
 
         if FLASK_AVAILABLE:
             port = int(os.environ.get("PORT", 10000))
@@ -1841,7 +1786,7 @@ class FundingSuiviBot:
 
 
 if __name__ == "__main__":
-    print("🤖 Bot Funding Suivi V14.4")
+    print("🤖 Bot Funding Suivi V14.5")
     print(f"   DRY_RUN={DRY_RUN} | TESTNET={BYBIT_TESTNET} | DISCORD={DISCORD_ENABLED} | NEWS={NEWS_ENABLED} | FLASK={FLASK_AVAILABLE}")
     bot = FundingSuiviBot()
     try:
